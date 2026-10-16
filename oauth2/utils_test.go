@@ -1,6 +1,7 @@
 package oauth2
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
 	"testing"
 
@@ -32,7 +33,7 @@ func TestGenerateRandomString(t *testing.T) {
 func TestGenerateRandomString_Unique(t *testing.T) {
 	// Generate multiple strings and ensure they're unique
 	generated := make(map[string]bool)
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		str, err := GenerateRandomString(32)
 		require.NoError(t, err)
 		assert.False(t, generated[str], "Generated strings should be unique")
@@ -62,7 +63,7 @@ func TestGenerateCodeVerifier(t *testing.T) {
 
 func TestGenerateCodeVerifier_Unique(t *testing.T) {
 	generated := make(map[string]bool)
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		verifier, err := GenerateCodeVerifier()
 		require.NoError(t, err)
 		assert.False(t, generated[verifier], "Code verifiers should be unique")
@@ -102,25 +103,13 @@ func TestGenerateCodeChallenge_DifferentVerifiers(t *testing.T) {
 	assert.NotEqual(t, challenge1, challenge2)
 }
 
-func TestBase64URLEncode(t *testing.T) {
-	tests := []struct {
-		input    []byte
-		expected string
-	}{
-		{[]byte("hello"), "aGVsbG8"},
-		{[]byte("test123"), "dGVzdDEyMw"},
-		{[]byte{0x00, 0x01, 0x02}, "AAEC"},
-	}
+func TestGenerateCodeChallenge_MatchesS256(t *testing.T) {
+	verifier, err := GenerateCodeVerifier()
+	require.NoError(t, err)
 
-	for _, test := range tests {
-		result := base64URLEncode(test.input)
-		assert.Equal(t, test.expected, result)
-
-		// Verify it can be decoded
-		decoded, err := base64.RawURLEncoding.DecodeString(result)
-		require.NoError(t, err)
-		assert.Equal(t, test.input, decoded)
-	}
+	// RFC 7636 S256: BASE64URL-ENCODE(SHA256(ASCII(code_verifier)))
+	sum := sha256.Sum256([]byte(verifier))
+	assert.Equal(t, base64.RawURLEncoding.EncodeToString(sum[:]), GenerateCodeChallenge(verifier))
 }
 
 func TestPKCE_Verification(t *testing.T) {

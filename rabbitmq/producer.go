@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -52,51 +53,79 @@ type PublishOptions struct {
 	// DeliveryMode: 0 = use Config.PersistentDelivery, 1 = transient, 2 = persistent
 	DeliveryMode uint8
 
-	Headers map[string]interface{}
+	Headers map[string]any
 }
 
 // PublishMessage publishes a message to the specified exchange/routing key.
-func (p *Producer) PublishMessage(ctx context.Context, opts PublishOptions, payload interface{}) error {
+func (p *Producer) PublishMessage(ctx context.Context, opts PublishOptions, payload any) error {
 	ctx, span := p.tracer.Start(ctx, "rabbitmq.publish",
 		trace.WithAttributes(),
 	)
 	defer span.End()
 
-	body, err := json.Marshal(payload)
+	ch, err := p.acquireChannel(ctx)
 	if err != nil {
 		span.RecordError(err)
-		return fmt.Errorf("failed to marshal payload: %w", err)
-	}
-
-	ch, err := p.client.GetPublisherChannel(ctx)
-	if err != nil {
-		span.RecordError(err)
-
-		// If disconnected, wait briefly for reconnection and retry once
-		if errors.Is(err, ErrNotConnected) {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(p.client.config.ReconnectInitialInterval):
-			}
-
-			ch, err = p.client.GetPublisherChannel(ctx)
-			if err != nil {
-				span.RecordError(err)
-				return fmt.Errorf("failed to get publisher channel after retry: %w", err)
-			}
-		} else {
-			return fmt.Errorf("failed to get publisher channel: %w", err)
-		}
+		return err
 	}
 	defer p.client.ReturnPublisherChannel(ch)
+
+	dc, err := p.publishOn(ctx, ch, opts, payload)
+	if err != nil {
+		span.RecordError(err)
+		return err
+	}
+	if err := waitConfirm(ctx, dc); err != nil {
+		span.RecordError(err)
+		return err
+	}
+
+	p.client.logger.Debug("message published successfully",
+		"exchange", opts.Exchange,
+		"routing_key", opts.RoutingKey,
+	)
+
+	return nil
+}
+
+// acquireChannel takes a publisher channel from the pool. If the client is
+// disconnected it waits ReconnectInitialInterval once for reconnection.
+func (p *Producer) acquireChannel(ctx context.Context) (*amqp.Channel, error) {
+	ch, err := p.client.GetPublisherChannel(ctx)
+	if err == nil {
+		return ch, nil
+	}
+	if !errors.Is(err, ErrNotConnected) {
+		return nil, fmt.Errorf("failed to get publisher channel: %w", err)
+	}
+
+	timer := time.NewTimer(p.client.config.ReconnectInitialInterval)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-timer.C:
+	}
+
+	ch, err = p.client.GetPublisherChannel(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get publisher channel after retry: %w", err)
+	}
+	return ch, nil
+}
+
+// publishOn marshals payload and publishes it on ch. When publisher confirms
+// are enabled it returns the pending confirmation for the caller to wait on.
+func (p *Producer) publishOn(ctx context.Context, ch *amqp.Channel, opts PublishOptions, payload any) (*amqp.DeferredConfirmation, error) {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal payload: %w", err)
+	}
 
 	// Prepare headers with OTel trace context
 	headers := amqp.Table{}
 	if opts.Headers != nil {
-		for k, v := range opts.Headers {
-			headers[k] = v
-		}
+		maps.Copy(headers, opts.Headers)
 	}
 
 	carrier := propagation.MapCarrier{}
@@ -112,10 +141,7 @@ func (p *Producer) PublishMessage(ctx context.Context, opts PublishOptions, payl
 		deliveryMode = amqp.Persistent
 	}
 
-	mandatory := p.client.config.Mandatory
-	if opts.Mandatory {
-		mandatory = true
-	}
+	mandatory := p.client.config.Mandatory || opts.Mandatory
 
 	contentType := opts.ContentType
 	if contentType == "" {
@@ -139,57 +165,38 @@ func (p *Producer) PublishMessage(ctx context.Context, opts PublishOptions, payl
 		Headers:         headers,
 	}
 
-	if p.client.config.PublisherConfirms {
-		dc, err := ch.PublishWithDeferredConfirmWithContext(
-			ctx,
-			opts.Exchange,
-			opts.RoutingKey,
-			mandatory,
-			opts.Immediate,
-			publishing,
-		)
-		if err != nil {
-			span.RecordError(err)
-			return fmt.Errorf("failed to publish message: %w", err)
+	if !p.client.config.PublisherConfirms {
+		if err := ch.PublishWithContext(ctx, opts.Exchange, opts.RoutingKey, mandatory, opts.Immediate, publishing); err != nil {
+			return nil, fmt.Errorf("failed to publish message: %w", err)
 		}
-
-		if dc != nil {
-			acked, waitErr := dc.WaitContext(ctx)
-			if waitErr != nil {
-				span.RecordError(waitErr)
-				return waitErr
-			}
-			if !acked {
-				err := fmt.Errorf("message was nacked by broker")
-				span.RecordError(err)
-				return err
-			}
-		}
-	} else {
-		err = ch.PublishWithContext(
-			ctx,
-			opts.Exchange,
-			opts.RoutingKey,
-			mandatory,
-			opts.Immediate,
-			publishing,
-		)
-		if err != nil {
-			span.RecordError(err)
-			return fmt.Errorf("failed to publish message: %w", err)
-		}
+		return nil, nil
 	}
 
-	p.client.logger.Debug("message published successfully",
-		"exchange", opts.Exchange,
-		"routing_key", opts.RoutingKey,
-	)
+	dc, err := ch.PublishWithDeferredConfirmWithContext(ctx, opts.Exchange, opts.RoutingKey, mandatory, opts.Immediate, publishing)
+	if err != nil {
+		return nil, fmt.Errorf("failed to publish message: %w", err)
+	}
+	return dc, nil
+}
 
+// waitConfirm blocks until the broker acks dc. A nil dc (confirms disabled)
+// returns immediately.
+func waitConfirm(ctx context.Context, dc *amqp.DeferredConfirmation) error {
+	if dc == nil {
+		return nil
+	}
+	acked, err := dc.WaitContext(ctx)
+	if err != nil {
+		return err
+	}
+	if !acked {
+		return errors.New("message was nacked by broker")
+	}
 	return nil
 }
 
 // SendMessage is a convenience method for sending to a direct queue.
-func (p *Producer) SendMessage(ctx context.Context, queueName string, payload interface{}) error {
+func (p *Producer) SendMessage(ctx context.Context, queueName string, payload any) error {
 	return p.PublishMessage(ctx, PublishOptions{
 		Exchange:   "",
 		RoutingKey: queueName,
@@ -197,7 +204,7 @@ func (p *Producer) SendMessage(ctx context.Context, queueName string, payload in
 }
 
 // SendMessageWithHeaders publishes a message with custom headers.
-func (p *Producer) SendMessageWithHeaders(ctx context.Context, queueName string, payload interface{}, headers map[string]interface{}) error {
+func (p *Producer) SendMessageWithHeaders(ctx context.Context, queueName string, payload any, headers map[string]any) error {
 	return p.PublishMessage(ctx, PublishOptions{
 		Exchange:   "",
 		RoutingKey: queueName,
@@ -206,7 +213,7 @@ func (p *Producer) SendMessageWithHeaders(ctx context.Context, queueName string,
 }
 
 // SendToTopic publishes a message to a topic exchange.
-func (p *Producer) SendToTopic(ctx context.Context, exchange, routingKey string, payload interface{}) error {
+func (p *Producer) SendToTopic(ctx context.Context, exchange, routingKey string, payload any) error {
 	return p.PublishMessage(ctx, PublishOptions{
 		Exchange:   exchange,
 		RoutingKey: routingKey,
@@ -214,7 +221,7 @@ func (p *Producer) SendToTopic(ctx context.Context, exchange, routingKey string,
 }
 
 // SendToTopicWithHeaders publishes a message to a topic exchange with custom headers.
-func (p *Producer) SendToTopicWithHeaders(ctx context.Context, exchange, routingKey string, payload interface{}, headers map[string]interface{}) error {
+func (p *Producer) SendToTopicWithHeaders(ctx context.Context, exchange, routingKey string, payload any, headers map[string]any) error {
 	return p.PublishMessage(ctx, PublishOptions{
 		Exchange:   exchange,
 		RoutingKey: routingKey,
@@ -222,11 +229,34 @@ func (p *Producer) SendToTopicWithHeaders(ctx context.Context, exchange, routing
 	}, payload)
 }
 
-// PublishBatch publishes multiple messages in a batch.
-func (p *Producer) PublishBatch(ctx context.Context, opts PublishOptions, payloads []interface{}) error {
+// PublishBatch publishes multiple messages on one channel. With publisher
+// confirms enabled, all messages are sent before waiting for any confirm, so
+// the batch costs one round trip instead of one per message.
+func (p *Producer) PublishBatch(ctx context.Context, opts PublishOptions, payloads []any) error {
+	ctx, span := p.tracer.Start(ctx, "rabbitmq.publish-batch")
+	defer span.End()
+
+	ch, err := p.acquireChannel(ctx)
+	if err != nil {
+		span.RecordError(err)
+		return err
+	}
+	defer p.client.ReturnPublisherChannel(ch)
+
+	confirms := make([]*amqp.DeferredConfirmation, 0, len(payloads))
 	for i, payload := range payloads {
-		if err := p.PublishMessage(ctx, opts, payload); err != nil {
+		dc, err := p.publishOn(ctx, ch, opts, payload)
+		if err != nil {
+			span.RecordError(err)
 			return fmt.Errorf("failed to publish message %d: %w", i, err)
+		}
+		confirms = append(confirms, dc)
+	}
+
+	for i, dc := range confirms {
+		if err := waitConfirm(ctx, dc); err != nil {
+			span.RecordError(err)
+			return fmt.Errorf("failed to confirm message %d: %w", i, err)
 		}
 	}
 	return nil

@@ -377,3 +377,80 @@ func TestClose(t *testing.T) {
 	err = client.PingContext(context.Background())
 	assert.Error(t, err, "all operations must fail after Close")
 }
+
+func TestQueryTimeout_QueryRowsIterable(t *testing.T) {
+	// The timeout context must outlive QueryContext so rows can still be read.
+	client := newSchema(t, db.ConnectionConfig{
+		QueryTimeout: 5 * time.Second,
+	})
+	ctx := context.Background()
+
+	rows, err := client.QueryContext(ctx, `SELECT generate_series(1, 100)`)
+	require.NoError(t, err)
+	defer rows.Close()
+
+	var n int
+	for rows.Next() {
+		n++
+	}
+	require.NoError(t, rows.Err())
+	assert.Equal(t, 100, n)
+}
+
+func TestQueryTimeout_QueryRowScan(t *testing.T) {
+	client := newSchema(t, db.ConnectionConfig{
+		QueryTimeout: 5 * time.Second,
+	})
+
+	var v int
+	err := client.QueryRowContext(context.Background(), `SELECT 42`).Scan(&v)
+	require.NoError(t, err)
+	assert.Equal(t, 42, v)
+}
+
+func TestIsSerializationError_SerializableConflict(t *testing.T) {
+	client := newSchema(t, db.ConnectionConfig{})
+	ctx := context.Background()
+
+	_, err := client.ExecContext(ctx, `INSERT INTO users (email) VALUES ('a@example.com')`)
+	require.NoError(t, err)
+
+	// Two serializable transactions read-then-write the same row; the second
+	// commit must fail with 40001.
+	started := make(chan struct{})
+	release := make(chan struct{})
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- client.WithTransaction(ctx, sql.LevelSerializable, func(ctx context.Context, tx db.DBTX) error {
+			var c int
+			if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM users`).Scan(&c); err != nil {
+				return err
+			}
+			close(started)
+			<-release
+			_, err := tx.ExecContext(ctx, `UPDATE users SET email = 'b@example.com'`)
+			return err
+		})
+	}()
+
+	<-started
+	err = client.WithTransaction(ctx, sql.LevelSerializable, func(ctx context.Context, tx db.DBTX) error {
+		var c int
+		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM users`).Scan(&c); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, `UPDATE users SET email = 'c@example.com'`)
+		return err
+	})
+	close(release)
+	otherErr := <-errCh
+
+	// Exactly one side loses; whichever it is must classify as serialization.
+	failed := err
+	if failed == nil {
+		failed = otherErr
+	}
+	require.Error(t, failed)
+	assert.True(t, db.IsSerializationError(failed), "got %v", failed)
+	assert.False(t, db.IsTimeoutError(failed), "serialization failure is not a timeout")
+}

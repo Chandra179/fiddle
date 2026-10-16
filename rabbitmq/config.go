@@ -1,7 +1,9 @@
 package rabbitmq
 
 import (
+	"crypto/tls"
 	"errors"
+	"math"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -35,6 +37,9 @@ type Config struct {
 	// Connection settings
 	URL            string
 	ConnectionName string
+	// TLSConfig is used for amqps:// URLs (custom CA, client certificates).
+	// nil uses the system roots with Go's default TLS settings.
+	TLSConfig *tls.Config
 
 	// Producer settings
 	PublisherConfirms  bool
@@ -53,7 +58,16 @@ type Config struct {
 	Exclusive  bool
 	NoWait     bool
 
-	// Retry/DLX settings
+	// Retry/DLX settings.
+	//
+	// RetryEnabled: a failed delivery is rejected without requeue so it flows
+	// through the queue's dead-letter exchange into the TTL retry queue (see
+	// TopologyManager.SetupDeadLetterExchange / SetupQueueWithDLX). Without a
+	// DLX on the queue, rejected messages are dropped. When false, failed
+	// deliveries are requeued immediately.
+	//
+	// DeadLetterEnabled: once MaxRetries is reached the message is published
+	// to "<queue>.parking-lot" and acked. When false it is rejected instead.
 	RetryEnabled      bool
 	RetryTTL          time.Duration
 	MaxRetries        int
@@ -137,6 +151,10 @@ func (c *Config) ApplyDefaults() error {
 		return errors.New("rabbitmq: reconnect max interval is required")
 	}
 
+	if c.ChannelMax < 0 || c.ChannelMax > math.MaxUint16 {
+		return errors.New("rabbitmq: channel max must be between 0 and 65535")
+	}
+
 	return nil
 }
 
@@ -147,7 +165,7 @@ type QueueConfig struct {
 	AutoDelete bool
 	Exclusive  bool
 	NoWait     bool
-	Args       map[string]interface{}
+	Args       map[string]any
 }
 
 // ExchangeConfig represents configuration for an exchange
@@ -158,7 +176,7 @@ type ExchangeConfig struct {
 	AutoDelete bool
 	Internal   bool
 	NoWait     bool
-	Args       map[string]interface{}
+	Args       map[string]any
 }
 
 // BindingConfig represents a queue binding
@@ -167,5 +185,5 @@ type BindingConfig struct {
 	Exchange   string
 	RoutingKey string
 	NoWait     bool
-	Args       map[string]interface{}
+	Args       map[string]any
 }

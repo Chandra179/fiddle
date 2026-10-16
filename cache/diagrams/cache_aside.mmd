@@ -13,7 +13,7 @@ sequenceDiagram
     R-->>C2: miss (nil)
     R-->>C3: miss (nil)
 
-    C1->>R: SETNX key:lock (lock acquired)
+    C1->>R: SETNX key:lock token (lock acquired)
     R-->>C1: true
     C2->>R: SETNX key:lock
     R-->>C2: false
@@ -25,7 +25,7 @@ sequenceDiagram
     R-->>C1: miss (nil)
     C1->>C1: fn() — compute value (DB query / API call)
     C1->>R: SET key value TTL
-    C1->>R: DEL key:lock (release lock)
+    C1->>R: DEL key:lock if value == token (release lock)
     C1-->>C1: return value
 
     Note over C2,C3: Spin-wait path

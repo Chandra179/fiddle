@@ -3,8 +3,11 @@ package cryptoutil
 import "errors"
 
 var (
-	ErrInvalidCost     = errors.New("bcrypt: invalid cost")
-	ErrMismatchedHash  = errors.New("bcrypt: hash and password mismatch")
+	ErrInvalidCost    = errors.New("bcrypt: invalid cost")
+	ErrMismatchedHash = errors.New("bcrypt: hash and password mismatch")
+	// ErrPasswordTooLong is returned by Bcrypter.Hash for passwords longer than
+	// 72 bytes, which bcrypt would otherwise silently truncate.
+	ErrPasswordTooLong = errors.New("bcrypt: password length exceeds 72 bytes")
 	ErrInvalidParams   = errors.New("scrypt: invalid parameters")
 	ErrKeyDerivation   = errors.New("scrypt: key derivation failed")
 )
@@ -24,10 +27,13 @@ type BcryptConfig struct {
 // Scrypter derives cryptographic keys using scrypt.
 type Scrypter interface {
 	DeriveKey(password, salt []byte) ([]byte, error)
+	// VerifyKey re-derives the key for password and salt and compares it with
+	// expected in constant time. It returns ErrMismatchedHash on mismatch.
+	VerifyKey(password, salt, expected []byte) error
 }
 
 // ScryptConfig configures the scrypt key derivation.
-// If zero-valued, defaults are used.
+// Zero-valued fields are filled from DefaultScryptConfig.
 type ScryptConfig struct {
 	N      int
 	R      int

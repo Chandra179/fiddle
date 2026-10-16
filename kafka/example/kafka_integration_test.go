@@ -1,8 +1,11 @@
+//go:build integration
+
 package example
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"log/slog"
@@ -280,7 +283,7 @@ func TestProducerConsumerFlow(t *testing.T) {
 
 	time.Sleep(2 * time.Second)
 
-	for i := 0; i < expectedCount; i++ {
+	for i := range expectedCount {
 		msg := TestMessage{
 			ID:      fmt.Sprintf("msg-%d", i),
 			Content: fmt.Sprintf("Message number %d", i),
@@ -365,6 +368,85 @@ func TestConsumerWithDLQ(t *testing.T) {
 	assert.Equal(t, 2, dlqCount, "expected 2 messages in DLQ")
 }
 
+// failingDLQ is a Producer whose DLQ publishes always fail.
+type failingDLQ struct{}
+
+func (failingDLQ) Produce(context.Context, *kafka.Message) error  { return nil }
+func (failingDLQ) SendMessage(context.Context, string, any) error { return nil }
+func (failingDLQ) SendToDLQ(context.Context, string, []byte, []byte, error) error {
+	return errors.New("dlq unavailable")
+}
+
+func TestConsumerStopsWhenDLQFails(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	topic := "test-dlq-failure"
+	group := "test-dlq-failure-group"
+	ensureTopicExists(t, topic)
+
+	producerClient := newClient(t, sharedBrokers, "")
+	producer := kafka.NewProducer(producerClient)
+
+	consumerClient := newClient(t, sharedBrokers, group, topic)
+
+	var handled []string
+	var mu sync.Mutex
+
+	handler := func(r *kgo.Record) error {
+		var msg TestMessage
+		if err := json.Unmarshal(r.Value, &msg); err != nil {
+			return err
+		}
+		mu.Lock()
+		handled = append(handled, msg.ID)
+		mu.Unlock()
+		if msg.Content == "fail" {
+			return errors.New("intentional failure for testing")
+		}
+		return nil
+	}
+
+	consumer := kafka.NewConsumer(consumerClient, kafka.ConsumerOptions{
+		Logger:       testLogger(t),
+		DLQProducer:  failingDLQ{},
+		MaxRetries:   1,
+		RetryBackoff: 10 * time.Millisecond,
+	})
+	startErr := make(chan error, 1)
+	go func() {
+		startErr <- consumer.Start(ctx, handler)
+	}()
+
+	time.Sleep(2 * time.Second)
+
+	// Offsets 0, 1, 2 on the single partition; offset 1 cannot be dead-lettered.
+	for _, msg := range []TestMessage{
+		{ID: "1", Content: "success"},
+		{ID: "2", Content: "fail"},
+		{ID: "3", Content: "success"},
+	} {
+		require.NoError(t, producer.SendMessage(ctx, topic, msg))
+	}
+
+	select {
+	case err := <-startErr:
+		require.ErrorIs(t, err, kafka.ErrDLQPublish)
+	case <-ctx.Done():
+		t.Fatal("timeout waiting for Start to return")
+	}
+
+	mu.Lock()
+	assert.NotContains(t, handled, "3", "records after the failed one must not be handled")
+	mu.Unlock()
+
+	offsets, err := kadm.NewClient(sharedClient).FetchOffsets(ctx, group)
+	require.NoError(t, err)
+	committed, ok := offsets.Lookup(topic, 0)
+	require.True(t, ok, "offset for the record before the failure should be committed")
+	assert.Equal(t, int64(1), committed.At, "the record whose DLQ publish failed must not be committed")
+}
+
 func TestHealthChecker(t *testing.T) {
 	ctx := context.Background()
 
@@ -425,7 +507,7 @@ func TestConfig(t *testing.T) {
 
 	t.Run("config with SASL PLAIN", func(t *testing.T) {
 		cfg := kafka.DefaultConfig([]string{"localhost:9092"}, "test-group")
-		cfg.WithSASLPlain("user", "pass")
+		cfg.WithSASLPlain("user", "pass").WithTLS(nil)
 		assert.Equal(t, "PLAIN", cfg.SASLMechanism)
 		assert.Equal(t, "user", cfg.SASLUsername)
 		err := cfg.Validate()

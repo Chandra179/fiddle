@@ -14,6 +14,10 @@ type Manager interface {
 	// GetAuthURL generates an authorization URL with state, nonce, and PKCE for the named provider.
 	GetAuthURL(providerName string) (string, error)
 
+	// GetAuthURLWithState is GetAuthURL that also returns the generated state,
+	// so callers can bind it to the browser (e.g. a cookie) for login CSRF protection.
+	GetAuthURLWithState(providerName string) (authURL string, state string, err error)
+
 	// HandleCallback handles the OAuth2/OIDC callback and invokes the configured callback handler.
 	HandleCallback(ctx context.Context, providerName, code, state string) (*CallbackInfo, error)
 
@@ -64,6 +68,10 @@ type UserInfo struct {
 
 	// Email is the user's email address (if available)
 	Email string `json:"email"`
+
+	// EmailVerified reports the provider's email_verified claim. Do not trust
+	// Email for account linking unless this is true.
+	EmailVerified bool `json:"email_verified"`
 
 	// Name is the user's display name (if available)
 	Name string `json:"name"`

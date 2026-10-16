@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -155,7 +156,7 @@ func TestProducer_PublishMessage(t *testing.T) {
 			consumerCtx, consumerCancel := context.WithTimeout(ctx, 20*time.Second)
 			defer consumerCancel()
 
-			handler := func(_ context.Context, msg interface{}, _ amqp.Delivery) error {
+			handler := func(_ context.Context, msg any, _ amqp.Delivery) error {
 				body, _ := json.Marshal(msg)
 				var testMsg TestMessage
 				if err := json.Unmarshal(body, &testMsg); err != nil {
@@ -219,7 +220,7 @@ func TestConsumer_ManualAck(t *testing.T) {
 			consumerCtx, consumerCancel := context.WithTimeout(ctx, 5*time.Second)
 			defer consumerCancel()
 
-			handler := func(_ context.Context, _ interface{}, _ amqp.Delivery) error {
+			handler := func(_ context.Context, _ any, _ amqp.Delivery) error {
 				select {
 				case handlerCalled <- true:
 				default:
@@ -287,7 +288,7 @@ func TestClient_Reconnection(t *testing.T) {
 
 		// Wait for reconnection
 		var reconnected bool
-		for i := 0; i < 60; i++ {
+		for range 60 {
 			time.Sleep(500 * time.Millisecond)
 			if client.IsHealthy() {
 				reconnected = true
@@ -323,7 +324,7 @@ func TestBatchConsumer(t *testing.T) {
 		producer := rabbitmq.NewProducer(client)
 
 		// Send 5 messages
-		for i := 0; i < 5; i++ {
+		for i := range 5 {
 			err := producer.SendMessage(ctx, queueName, TestMessage{
 				ID:        fmt.Sprintf("batch-%d", i),
 				Content:   "Batch test",
@@ -339,7 +340,7 @@ func TestBatchConsumer(t *testing.T) {
 			consumerCtx, consumerCancel := context.WithTimeout(ctx, 15*time.Second)
 			defer consumerCancel()
 
-			handler := func(_ context.Context, messages []interface{}, _ []amqp.Delivery) error {
+			handler := func(_ context.Context, messages []any, _ []amqp.Delivery) error {
 				select {
 				case batchReceived <- len(messages):
 				default:
@@ -373,7 +374,7 @@ func TestConsumer_AutoReconnect(t *testing.T) {
 		received := make(chan string, 10)
 
 		go func() {
-			handler := func(_ context.Context, msg interface{}, _ amqp.Delivery) error {
+			handler := func(_ context.Context, msg any, _ amqp.Delivery) error {
 				body, _ := json.Marshal(msg)
 				var testMsg TestMessage
 				if err := json.Unmarshal(body, &testMsg); err != nil {
@@ -411,7 +412,7 @@ func TestConsumer_AutoReconnect(t *testing.T) {
 		require.NoError(t, testContainer.Start(ctx), "failed to start container")
 
 		// Wait for reconnection
-		for i := 0; i < 60; i++ {
+		for range 60 {
 			time.Sleep(500 * time.Millisecond)
 			if client.IsHealthy() {
 				break
@@ -435,4 +436,112 @@ func TestConsumer_AutoReconnect(t *testing.T) {
 			t.Fatal("timeout waiting for message after reconnection")
 		}
 	})
+}
+
+func TestConsumer_MaxRetriesMovesToParkingLot(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	client := newTestClient(t, func(c *rabbitmq.Config) {
+		c.MaxRetries = 2
+	})
+	tm := rabbitmq.NewTopologyManager(client)
+
+	mainQueue := "test-parking-main"
+	dlxName := "test-parking-dlx"
+	require.NoError(t, tm.SetupDeadLetterExchange(mainQueue, dlxName, 200))
+	_, err := tm.SetupQueueWithDLX(mainQueue, dlxName)
+	require.NoError(t, err)
+
+	producer := rabbitmq.NewProducer(client)
+	require.NoError(t, producer.SendMessage(ctx, mainQueue, TestMessage{ID: "poison"}))
+
+	// The handler always fails: the message must go main -> retry (TTL) ->
+	// main twice, then land in the parking lot instead of looping forever.
+	var attempts atomic.Int32
+	consumerCtx, stopConsumer := context.WithCancel(ctx)
+	defer stopConsumer()
+	go func() {
+		_ = rabbitmq.NewConsumer(client, testLogger).ConsumeWithDefaults(consumerCtx, mainQueue,
+			func(context.Context, any, amqp.Delivery) error {
+				attempts.Add(1)
+				return fmt.Errorf("always fails")
+			})
+	}()
+
+	ch, err := client.CreateConsumerChannel()
+	require.NoError(t, err)
+	defer ch.Close()
+
+	parkingLot := mainQueue + ".parking-lot"
+	require.Eventually(t, func() bool {
+		q, err := ch.QueueDeclarePassive(parkingLot, true, false, false, false, nil)
+		return err == nil && q.Messages == 1
+	}, 30*time.Second, 200*time.Millisecond, "message must reach the parking lot")
+
+	assert.Equal(t, int32(3), attempts.Load(), "1 initial attempt + 2 retries")
+}
+
+func TestPublisherPool_SurvivesChannelErrors(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	client := newTestClient(t, func(c *rabbitmq.Config) {
+		c.ChannelPoolSize = 2
+	})
+	queueName := newTestQueue(t, client, "test-pool-survives")
+	producer := rabbitmq.NewProducer(client)
+
+	// Publishing to a missing exchange closes the channel with a 404. Do it
+	// more times than the pool has channels; the pool must replace them.
+	for range 5 {
+		err := producer.SendToTopic(ctx, "exchange-that-does-not-exist", "rk", TestMessage{ID: "x"})
+		require.Error(t, err)
+	}
+
+	publishCtx, publishCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer publishCancel()
+	require.NoError(t, producer.SendMessage(publishCtx, queueName, TestMessage{ID: "after-errors"}))
+}
+
+func TestPublishBatch_ConfirmsAll(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	client := newTestClient(t)
+	queueName := newTestQueue(t, client, "test-publish-batch")
+
+	payloads := make([]any, 50)
+	for i := range payloads {
+		payloads[i] = TestMessage{ID: fmt.Sprintf("batch-%d", i)}
+	}
+	require.NoError(t, rabbitmq.NewProducer(client).PublishBatch(ctx, rabbitmq.PublishOptions{RoutingKey: queueName}, payloads))
+
+	ch, err := client.CreateConsumerChannel()
+	require.NoError(t, err)
+	defer ch.Close()
+	q, err := ch.QueueDeclarePassive(queueName, true, false, false, false, nil)
+	require.NoError(t, err)
+	assert.Equal(t, 50, q.Messages)
+}
+
+func TestClient_CloseTwice(t *testing.T) {
+	client, err := rabbitmq.NewClient(&rabbitmq.Config{
+		URL:                      testURL,
+		ConnectionName:           t.Name(),
+		ChannelPoolSize:          1,
+		PrefetchCount:            1,
+		QueueType:                rabbitmq.QueueTypeClassic,
+		RetryTTL:                 time.Second,
+		MaxRetries:               1,
+		ReconnectInitialInterval: time.Second,
+		ReconnectMaxInterval:     time.Second,
+	}, testLogger)
+	require.NoError(t, err)
+
+	assert.NotPanics(t, func() {
+		require.NoError(t, client.Close())
+		require.NoError(t, client.Close())
+	})
+	assert.False(t, client.IsHealthy())
 }

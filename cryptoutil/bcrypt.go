@@ -1,6 +1,8 @@
 package cryptoutil
 
 import (
+	"errors"
+
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -24,6 +26,9 @@ func NewBcrypter(cfg BcryptConfig) (Bcrypter, error) {
 
 func (b *bcrypter) Hash(password string) (string, error) {
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), b.cost)
+	if errors.Is(err, bcrypt.ErrPasswordTooLong) {
+		return "", ErrPasswordTooLong
+	}
 	if err != nil {
 		return "", err
 	}
@@ -32,7 +37,7 @@ func (b *bcrypter) Hash(password string) (string, error) {
 
 func (b *bcrypter) Compare(password, hash string) error {
 	err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password))
-	if err == bcrypt.ErrMismatchedHashAndPassword {
+	if errors.Is(err, bcrypt.ErrMismatchedHashAndPassword) {
 		return ErrMismatchedHash
 	}
 	return err

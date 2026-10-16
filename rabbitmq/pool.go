@@ -2,92 +2,112 @@ package rabbitmq
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
-	"sync/atomic"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
+// errPoolClosed is returned by get after the pool has been closed.
+var errPoolClosed = errors.New("rabbitmq: channel pool is closed")
+
+// channelFactory opens a new, fully configured publisher channel on the
+// client's current connection.
+type channelFactory func() (*amqp.Channel, error)
+
 // channelPool manages a pool of pre-allocated AMQP channels for publishing.
 // It is safe for concurrent use.
+//
+// Channels that are found closed (e.g. after a channel-level exception such as
+// publishing to a missing exchange) are replaced through the factory, so the
+// pool does not shrink over time.
 type channelPool struct {
 	channels chan *amqp.Channel
 	size     int
-	closed   atomic.Bool
-	mu       sync.Mutex
+	factory  channelFactory
+
+	// mu guards closed and every send on channels, so a send can never race
+	// with close(channels).
+	mu     sync.Mutex
+	closed bool
 }
 
-func newChannelPool(size int) *channelPool {
+func newChannelPool(size int, factory channelFactory) *channelPool {
 	return &channelPool{
 		channels: make(chan *amqp.Channel, size),
 		size:     size,
+		factory:  factory,
 	}
 }
 
-// fill populates the pool with channels from the given connection.
-// If onReturn is non-nil, a NotifyReturn listener is registered per channel
-// and forwarded to the callback in a dedicated goroutine.
-func (p *channelPool) fill(conn *amqp.Connection, enableConfirms bool, onReturn func(amqp.Return)) error {
-	for i := 0; i < p.size; i++ {
-		ch, err := conn.Channel()
+// fill populates the pool up to its size with channels from the factory.
+func (p *channelPool) fill() error {
+	for i := range p.size {
+		ch, err := p.factory()
 		if err != nil {
 			return fmt.Errorf("failed to create channel %d: %w", i, err)
 		}
-
-		if enableConfirms {
-			if err := ch.Confirm(false); err != nil {
-				ch.Close()
-				return fmt.Errorf("failed to enable confirms on channel %d: %w", i, err)
-			}
+		if !p.put(ch) {
+			_ = ch.Close()
 		}
-
-		if onReturn != nil {
-			returnChan := ch.NotifyReturn(make(chan amqp.Return, 1))
-			go func() {
-				for r := range returnChan {
-					onReturn(r)
-				}
-			}()
-		}
-
-		p.channels <- ch
 	}
 	return nil
 }
 
-// get retrieves a channel from the pool, respecting context cancellation.
-func (p *channelPool) get(ctx context.Context) (*amqp.Channel, error) {
-	if p.closed.Load() {
-		return nil, fmt.Errorf("channel pool is closed")
+// put offers ch to the pool without blocking. It reports false when the pool
+// is closed or already full, in which case the caller owns ch.
+func (p *channelPool) put(ch *amqp.Channel) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return false
 	}
-
 	select {
-	case ch := <-p.channels:
+	case p.channels <- ch:
+		return true
+	default:
+		return false
+	}
+}
+
+// get retrieves a channel from the pool, respecting context cancellation.
+// A closed channel taken from the pool is replaced with a fresh one.
+func (p *channelPool) get(ctx context.Context) (*amqp.Channel, error) {
+	select {
+	case ch, ok := <-p.channels:
+		if !ok {
+			return nil, errPoolClosed
+		}
 		if ch != nil && !ch.IsClosed() {
 			return ch, nil
 		}
-		return nil, fmt.Errorf("channel is closed")
+		fresh, err := p.factory()
+		if err != nil {
+			return nil, fmt.Errorf("replace closed channel: %w", err)
+		}
+		return fresh, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
 }
 
-// returnCh returns a channel to the pool. Closed or nil channels are discarded.
+// returnCh returns a channel to the pool. A closed channel is replaced so the
+// pool keeps its size; if no replacement can be opened (connection down), the
+// slot is refilled by the next fill after reconnection.
 func (p *channelPool) returnCh(ch *amqp.Channel) {
-	if ch == nil || ch.IsClosed() {
+	if ch == nil {
 		return
 	}
-
-	if p.closed.Load() {
-		ch.Close()
-		return
+	if ch.IsClosed() {
+		fresh, err := p.factory()
+		if err != nil {
+			return
+		}
+		ch = fresh
 	}
-
-	select {
-	case p.channels <- ch:
-	default:
-		ch.Close()
+	if !p.put(ch) {
+		_ = ch.Close()
 	}
 }
 
@@ -95,9 +115,12 @@ func (p *channelPool) returnCh(ch *amqp.Channel) {
 func (p *channelPool) drain() {
 	for {
 		select {
-		case ch := <-p.channels:
+		case ch, ok := <-p.channels:
+			if !ok {
+				return
+			}
 			if ch != nil && !ch.IsClosed() {
-				ch.Close()
+				_ = ch.Close()
 			}
 		default:
 			return
@@ -108,17 +131,14 @@ func (p *channelPool) drain() {
 // close permanently shuts down the pool and closes all remaining channels.
 // After close, get returns an error and returnCh discards channels.
 func (p *channelPool) close() {
-	if !p.closed.CompareAndSwap(false, true) {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
 		return
 	}
-
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
+	p.closed = true
 	close(p.channels)
-	for ch := range p.channels {
-		if ch != nil && !ch.IsClosed() {
-			ch.Close()
-		}
-	}
+	p.mu.Unlock()
+
+	p.drain()
 }

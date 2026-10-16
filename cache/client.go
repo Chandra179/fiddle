@@ -22,6 +22,9 @@ type Cache interface {
 	SetNX(ctx context.Context, key string, value string, ttl time.Duration) (bool, error)
 	Get(ctx context.Context, key string) (string, error)
 	Del(ctx context.Context, key string) error
+	// DelIfValue atomically deletes key only if its current value equals value.
+	// Returns true if the key was deleted. Use to release a lock you own.
+	DelIfValue(ctx context.Context, key, value string) (bool, error)
 	Ping(ctx context.Context) error
 	Close() error
 }

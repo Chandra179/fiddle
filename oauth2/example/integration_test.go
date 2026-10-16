@@ -10,10 +10,12 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/go-jose/go-jose/v4"
 	josejwt "github.com/go-jose/go-jose/v4/jwt"
 	"github.com/stretchr/testify/assert"
@@ -26,6 +28,8 @@ type oidcServer struct {
 	server     *httptest.Server
 	privateKey *rsa.PrivateKey
 	keyID      string
+	// omitEndSession leaves end_session_endpoint out of discovery
+	omitEndSession bool
 }
 
 func (s *oidcServer) issuer() string { return s.server.URL }
@@ -39,6 +43,9 @@ func (s *oidcServer) discovery(w http.ResponseWriter, r *http.Request) {
 		"id_token_signing_alg_values_supported": []string{"RS256"},
 		"response_types_supported":              []string{"code"},
 		"subject_types_supported":               []string{"public"},
+	}
+	if !s.omitEndSession {
+		doc["end_session_endpoint"] = s.issuer() + "/end-session"
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(doc)
@@ -95,13 +102,15 @@ func (s *oidcServer) token(w http.ResponseWriter, r *http.Request) {
 		Expiry:   josejwt.NewNumericDate(now.Add(time.Hour)),
 	}
 	extra := struct {
-		Email string `json:"email"`
-		Name  string `json:"name"`
-		Nonce string `json:"nonce"`
+		Email         string `json:"email"`
+		EmailVerified bool   `json:"email_verified"`
+		Name          string `json:"name"`
+		Nonce         string `json:"nonce"`
 	}{
-		Email: "test@example.com",
-		Name:  "Test User",
-		Nonce: nonce,
+		Email:         "test@example.com",
+		EmailVerified: true,
+		Name:          "Test User",
+		Nonce:         nonce,
 	}
 
 	idToken, err := josejwt.Signed(sig).Claims(claims).Claims(extra).Serialize()
@@ -124,6 +133,7 @@ func (s *oidcServer) token(w http.ResponseWriter, r *http.Request) {
 // package-level variables shared across tests
 var (
 	mockOIDC *oidcServer
+	provider *oauth2pkg.GoogleOIDCProvider
 	manager  oauth2pkg.Manager
 )
 
@@ -134,19 +144,12 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	mockOIDC = &oidcServer{privateKey: privateKey, keyID: "test-key-id"}
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/.well-known/openid-configuration", mockOIDC.discovery)
-	mux.HandleFunc("/jwks", mockOIDC.jwks)
-	mux.HandleFunc("/token", mockOIDC.token)
-	// /auth endpoint is not exercised in these tests (we simulate callbacks directly)
-	mockOIDC.server = httptest.NewServer(mux)
+	mockOIDC = newOIDCServer(privateKey, false)
 
 	ctx := context.Background()
 
 	// Use NewOIDCProvider so we can point at the mock server instead of accounts.google.com
-	provider, err := oauth2pkg.NewOIDCProvider(
+	provider, err = oauth2pkg.NewOIDCProvider(
 		ctx,
 		mockOIDC.issuer(),
 		"google",
@@ -254,6 +257,118 @@ func TestIntegration_ConcurrentAuthURLs(t *testing.T) {
 		assert.False(t, seen[state], "state must be unique across concurrent requests")
 		seen[state] = true
 	}
+}
+
+func TestIntegration_EndSessionEndpoint(t *testing.T) {
+	assert.Equal(t, mockOIDC.issuer()+"/end-session", provider.GetEndSessionEndpoint())
+}
+
+func TestIntegration_EndSessionEndpoint_Fallback(t *testing.T) {
+	srv := newOIDCServer(mockOIDC.privateKey, true)
+	t.Cleanup(srv.server.Close)
+
+	p, err := oauth2pkg.NewOIDCProvider(context.Background(), srv.issuer(), "other",
+		"test-client-id", "test-client-secret", srv.issuer()+"/callback", nil)
+	require.NoError(t, err)
+	assert.Equal(t, srv.issuer()+"/logout", p.GetEndSessionEndpoint())
+}
+
+func TestIntegration_HTTPFlowWithStateCookie(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	var gotUser *oauth2pkg.UserInfo
+	mgr, err := oauth2pkg.NewManager(context.Background(), &oauth2pkg.ManagerConfig{
+		CallbackHandler: func(ctx context.Context, providerName string, userInfo *oauth2pkg.UserInfo, tokenSet *oauth2pkg.TokenSet) (*oauth2pkg.CallbackInfo, error) {
+			gotUser = userInfo
+			return &oauth2pkg.CallbackInfo{
+				SessionCookieName: "session",
+				UserID:            userInfo.ID,
+				SessionID:         "session-" + userInfo.ID,
+				CookieMaxAge:      3600,
+			}, nil
+		},
+	})
+	require.NoError(t, err)
+	t.Cleanup(mgr.Cleanup)
+	mgr.RegisterProvider(provider)
+
+	router := gin.New()
+	router.GET("/login", oauth2pkg.GoogleLoginHandler(mgr, nil))
+	router.GET("/callback", oauth2pkg.GoogleCallbackHandler(mgr, nil))
+
+	login := func(t *testing.T) (state, nonce string, stateCookie *http.Cookie) {
+		t.Helper()
+		w := httptest.NewRecorder()
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "/login", nil)
+		require.NoError(t, err)
+		router.ServeHTTP(w, req)
+		require.Equal(t, http.StatusFound, w.Code)
+
+		location, err := url.Parse(w.Header().Get("Location"))
+		require.NoError(t, err)
+		assert.Equal(t, mockOIDC.issuer()+"/auth", location.Scheme+"://"+location.Host+location.Path)
+
+		for _, c := range w.Result().Cookies() {
+			if c.Name == "oauth2_state" {
+				stateCookie = c
+			}
+		}
+		require.NotNil(t, stateCookie)
+		assert.True(t, stateCookie.HttpOnly)
+		assert.Equal(t, http.SameSiteLaxMode, stateCookie.SameSite)
+		return location.Query().Get("state"), location.Query().Get("nonce"), stateCookie
+	}
+
+	callback := func(t *testing.T, state, nonce string, cookie *http.Cookie) *httptest.ResponseRecorder {
+		t.Helper()
+		w := httptest.NewRecorder()
+		q := url.Values{"code": {"code:" + nonce}, "state": {state}}
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "/callback?"+q.Encode(), nil)
+		require.NoError(t, err)
+		if cookie != nil {
+			req.AddCookie(cookie)
+		}
+		router.ServeHTTP(w, req)
+		return w
+	}
+
+	t.Run("matching cookie authenticates", func(t *testing.T) {
+		state, nonce, cookie := login(t)
+		assert.Equal(t, state, cookie.Value)
+
+		w := callback(t, state, nonce, cookie)
+		require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+		require.NotNil(t, gotUser)
+		assert.Equal(t, "user-sub-123", gotUser.ID)
+		assert.Equal(t, "test@example.com", gotUser.Email)
+		assert.True(t, gotUser.EmailVerified)
+	})
+
+	t.Run("missing cookie is rejected", func(t *testing.T) {
+		state, nonce, _ := login(t)
+		w := callback(t, state, nonce, nil)
+		assert.Equal(t, http.StatusUnauthorized, w.Code)
+	})
+
+	t.Run("cookie from another login is rejected", func(t *testing.T) {
+		// Login CSRF: attacker's state in the URL, victim's own cookie in the browser
+		attackerState, attackerNonce, _ := login(t)
+		_, _, victimCookie := login(t)
+		w := callback(t, attackerState, attackerNonce, victimCookie)
+		assert.Equal(t, http.StatusUnauthorized, w.Code)
+	})
+}
+
+func newOIDCServer(privateKey *rsa.PrivateKey, omitEndSession bool) *oidcServer {
+	s := &oidcServer{privateKey: privateKey, keyID: "test-key-id", omitEndSession: omitEndSession}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/.well-known/openid-configuration", s.discovery)
+	mux.HandleFunc("/jwks", s.jwks)
+	mux.HandleFunc("/token", s.token)
+	// /auth endpoint is not exercised in these tests (we simulate callbacks directly)
+	s.server = httptest.NewServer(mux)
+	return s
 }
 
 // extractParam parses a named query parameter from a raw URL string.
