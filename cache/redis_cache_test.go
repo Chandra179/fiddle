@@ -439,16 +439,14 @@ func TestRedisCache_GetOrSet_ThunderingHerd(t *testing.T) {
 	n := 10
 
 	for range n {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			val, err := GetOrSet(ctx, cache, key, time.Minute, func(_ context.Context) (string, error) {
 				callCount.Add(1)
 				return "herd-value", nil
 			})
 			assert.NoError(t, err)
 			assert.Equal(t, "herd-value", val)
-		}()
+		})
 	}
 	wg.Wait()
 
@@ -466,4 +464,122 @@ func TestRedisCache_GetOrSet_CustomLockTTL(t *testing.T) {
 	}, GetOrSetOptions{LockTTL: 5 * time.Second})
 	assert.NoError(t, err)
 	assert.Equal(t, "custom-lock", val)
+}
+
+func TestNewRedisCacheFromConfig(t *testing.T) {
+	mr, err := miniredis.Run()
+	require.NoError(t, err)
+	defer mr.Close()
+	mr.RequireUserAuth("app", "secret")
+
+	ctx := context.Background()
+
+	t.Run("auth and DB selection", func(t *testing.T) {
+		c := NewRedisCacheFromConfig(RedisConfig{
+			Addr:         mr.Addr(),
+			Username:     "app",
+			Password:     "secret",
+			DB:           2,
+			DialTimeout:  time.Second,
+			ReadTimeout:  time.Second,
+			WriteTimeout: time.Second,
+			PoolSize:     2,
+		})
+		t.Cleanup(func() { _ = c.Close() })
+
+		require.NoError(t, c.Ping(ctx))
+		require.NoError(t, c.Set(ctx, "cfg-key", "cfg-value", time.Minute))
+
+		val, err := mr.DB(2).Get("cfg-key")
+		require.NoError(t, err)
+		assert.Equal(t, "cfg-value", val)
+		assert.False(t, mr.Exists("cfg-key"), "key must not land in DB 0")
+		assert.Equal(t, mr.Addr(), c.(*RedisCache).Addr())
+	})
+
+	t.Run("wrong password fails", func(t *testing.T) {
+		c := NewRedisCacheFromConfig(RedisConfig{Addr: mr.Addr(), Username: "app", Password: "wrong"})
+		t.Cleanup(func() { _ = c.Close() })
+
+		assert.Error(t, c.Ping(ctx))
+	})
+}
+
+func TestRedisCache_DelIfValue(t *testing.T) {
+	mr, cache := setupTestRedis(t)
+	defer mr.Close()
+
+	ctx := context.Background()
+
+	t.Run("matching value deletes", func(t *testing.T) {
+		require.NoError(t, mr.Set("div-match", "token-a"))
+
+		deleted, err := cache.DelIfValue(ctx, "div-match", "token-a")
+		require.NoError(t, err)
+		assert.True(t, deleted)
+		assert.False(t, mr.Exists("div-match"))
+	})
+
+	t.Run("different value keeps key", func(t *testing.T) {
+		require.NoError(t, mr.Set("div-mismatch", "token-b"))
+
+		deleted, err := cache.DelIfValue(ctx, "div-mismatch", "token-a")
+		require.NoError(t, err)
+		assert.False(t, deleted)
+
+		val, err := mr.Get("div-mismatch")
+		require.NoError(t, err)
+		assert.Equal(t, "token-b", val)
+	})
+
+	t.Run("missing key", func(t *testing.T) {
+		deleted, err := cache.DelIfValue(ctx, "div-missing", "token-a")
+		require.NoError(t, err)
+		assert.False(t, deleted)
+	})
+}
+
+// Leader's fn outlives LockTTL, another owner takes the lock; the leader's
+// release must leave the new owner's lock intact.
+func TestRedisCache_GetOrSet_ReleaseKeepsOtherOwnersLock(t *testing.T) {
+	mr, cache := setupTestRedis(t)
+	defer mr.Close()
+
+	ctx := context.Background()
+	key := "gos-steal"
+	lockKey := key + lockSuffix
+
+	val, err := GetOrSet(ctx, cache, key, time.Minute, func(ctx context.Context) (string, error) {
+		token, err := mr.Get(lockKey)
+		require.NoError(t, err)
+		assert.NotEqual(t, lockKey, token, "lock value must be a random token")
+
+		mr.FastForward(2 * time.Second) // leader's lock expires
+		ok, err := cache.SetNX(ctx, lockKey, "other-owner", time.Minute)
+		require.NoError(t, err)
+		require.True(t, ok, "other owner must acquire expired lock")
+		return "leader-value", nil
+	}, GetOrSetOptions{LockTTL: time.Second})
+	require.NoError(t, err)
+	assert.Equal(t, "leader-value", val)
+
+	owner, err := mr.Get(lockKey)
+	require.NoError(t, err, "other owner's lock must survive leader's release")
+	assert.Equal(t, "other-owner", owner)
+}
+
+// A request cancelled while computing must still release its lock.
+func TestRedisCache_GetOrSet_CancelledRequestReleasesLock(t *testing.T) {
+	mr, cache := setupTestRedis(t)
+	defer mr.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	key := "gos-cancel-release"
+
+	_, err := GetOrSet(ctx, cache, key, time.Minute, func(_ context.Context) (string, error) {
+		cancel()
+		return "value", nil
+	})
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.False(t, mr.Exists(key+lockSuffix), "lock must be released despite cancelled ctx")
 }

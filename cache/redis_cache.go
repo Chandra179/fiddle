@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"time"
 
@@ -17,15 +18,44 @@ type RedisCache struct {
 	addr   string
 }
 
-// NewRedisCache connects to a Redis instance at addr (host:port).
-// Returns a Cache interface.
-// No auth or TLS — use redis:// URL for production or extend.
+// RedisConfig configures a RedisCache. Zero values fall back to go-redis
+// defaults (e.g. DialTimeout 5s, Read/WriteTimeout 3s, PoolSize 10*GOMAXPROCS).
+type RedisConfig struct {
+	Addr     string // host:port
+	Username string // ACL user (Redis 6+); empty for default user
+	Password string
+	DB       int
+	// TLSConfig enables TLS when non-nil.
+	TLSConfig    *tls.Config
+	DialTimeout  time.Duration
+	ReadTimeout  time.Duration
+	WriteTimeout time.Duration
+	PoolSize     int
+}
+
+// NewRedisCacheFromConfig creates a Cache from cfg. Use for auth, TLS,
+// DB selection and pool/timeouts tuning.
+// On connect failure the first op will error, not this call.
+func NewRedisCacheFromConfig(cfg RedisConfig) Cache {
+	rdb := redis.NewClient(&redis.Options{
+		Addr:         cfg.Addr,
+		Username:     cfg.Username,
+		Password:     cfg.Password,
+		DB:           cfg.DB,
+		TLSConfig:    cfg.TLSConfig,
+		DialTimeout:  cfg.DialTimeout,
+		ReadTimeout:  cfg.ReadTimeout,
+		WriteTimeout: cfg.WriteTimeout,
+		PoolSize:     cfg.PoolSize,
+	})
+	return &RedisCache{client: rdb, addr: cfg.Addr}
+}
+
+// NewRedisCache connects to a Redis instance at addr (host:port) with
+// defaults: no auth, no TLS. Use NewRedisCacheFromConfig for anything else.
 // On connect failure the first op will error, not this call.
 func NewRedisCache(addr string) Cache {
-	rdb := redis.NewClient(&redis.Options{
-		Addr: addr,
-	})
-	return &RedisCache{client: rdb, addr: addr}
+	return NewRedisCacheFromConfig(RedisConfig{Addr: addr})
 }
 
 // Addr returns the Redis server address this cache connects to.
@@ -49,16 +79,37 @@ func (r *RedisCache) Get(ctx context.Context, key string) (string, error) {
 	return val, err
 }
 
-// Del removes one or more keys. No-op if key missing.
+// Del removes key. No-op if key missing.
 // Use for: cache invalidation on write, manual eviction.
 // Limitation: single-node — no cross-shard delete in cluster.
 func (r *RedisCache) Del(ctx context.Context, key string) error {
 	return r.client.Del(ctx, key).Err()
 }
 
+// delIfValueScript deletes KEYS[1] only if its value equals ARGV[1].
+var delIfValueScript = redis.NewScript(`
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+	return redis.call("DEL", KEYS[1])
+end
+return 0
+`)
+
+// DelIfValue atomically deletes key only if its value equals value
+// (compare-and-delete via Lua). Returns true if the key was deleted.
+// Use for: releasing a lock you own (value = your random token), so an
+// expired-and-reacquired lock held by someone else is left intact.
+func (r *RedisCache) DelIfValue(ctx context.Context, key, value string) (bool, error) {
+	n, err := delIfValueScript.Run(ctx, r.client, []string{key}, value).Int()
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
+}
+
 // SetNX atomically sets key only if it does not exist. Returns true on success.
 // Use for: distributed locks, deduplication, first-writer-wins.
-// Limitation: not a reentrant lock — no lock-ID or TTL extension built in.
+// Limitation: not a reentrant lock — no TTL extension built in. Store a random
+// token as value and release with DelIfValue, not Del.
 func (r *RedisCache) SetNX(ctx context.Context, key, value string, ttl time.Duration) (bool, error) {
 	err := r.client.SetArgs(ctx, key, value, redis.SetArgs{
 		Mode: "NX",
@@ -81,7 +132,7 @@ func (r *RedisCache) Ping(ctx context.Context) error {
 }
 
 // Close shuts down the underlying Redis connection. Call once on app shutdown.
-// Further ops will error. Idempotent.
+// Further ops will error. Not idempotent: a second Close returns an error.
 func (r *RedisCache) Close() error {
 	return r.client.Close()
 }

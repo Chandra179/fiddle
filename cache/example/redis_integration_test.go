@@ -1,3 +1,5 @@
+//go:build integration
+
 package example
 
 import (
@@ -183,6 +185,24 @@ func TestDistributedLock(t *testing.T) {
 	assert.True(t, ok, "acquire after release must succeed")
 }
 
+func TestDelIfValue(t *testing.T) {
+	c := newCache(t, "div-lock")
+	ctx := context.Background()
+
+	require.NoError(t, c.Set(ctx, "div-lock", "owner-1", time.Minute))
+
+	deleted, err := c.DelIfValue(ctx, "div-lock", "owner-2")
+	require.NoError(t, err)
+	assert.False(t, deleted, "non-owner must not release the lock")
+
+	deleted, err = c.DelIfValue(ctx, "div-lock", "owner-1")
+	require.NoError(t, err)
+	assert.True(t, deleted, "owner must release the lock")
+
+	_, err = c.Get(ctx, "div-lock")
+	assert.True(t, cache.IsCacheMiss(err))
+}
+
 func TestCacheRefresh(t *testing.T) {
 	c := newCache(t, "refresh-key")
 	ctx := context.Background()
@@ -271,9 +291,7 @@ func TestGetOrSet_ThunderingHerd(t *testing.T) {
 	n := 10
 
 	for range n {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			val, err := cache.GetOrSet(ctx, c, "gos-herd", time.Minute, func(_ context.Context) (string, error) {
 				callCount.Add(1)
 				time.Sleep(10 * time.Millisecond)
@@ -281,7 +299,7 @@ func TestGetOrSet_ThunderingHerd(t *testing.T) {
 			})
 			assert.NoError(t, err)
 			assert.Equal(t, "herd-value", val)
-		}()
+		})
 	}
 	wg.Wait()
 
@@ -329,9 +347,7 @@ func TestGetOrSet_UserProfileScenario(t *testing.T) {
 	var wg sync.WaitGroup
 	dbCallCount.Store(0)
 	for range 10 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			val, err := cache.GetOrSet(ctx, c, "profile:user-stampede", time.Minute, func(_ context.Context) (string, error) {
 				dbCallCount.Add(1)
 				time.Sleep(10 * time.Millisecond) // simulate slow DB
@@ -340,7 +356,7 @@ func TestGetOrSet_UserProfileScenario(t *testing.T) {
 			}, cache.GetOrSetOptions{CacheNil: true})
 			assert.NoError(t, err)
 			assert.Equal(t, "Alice|alice@example.com", val)
-		}()
+		})
 	}
 	wg.Wait()
 	assert.Equal(t, int32(1), dbCallCount.Load(), "concurrent requests must not trigger extra DB calls")
@@ -364,9 +380,7 @@ func TestGetOrSet_DistributedStampede(t *testing.T) {
 	var wg sync.WaitGroup
 
 	for range 5 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			val, err := cache.GetOrSet(ctx, node1, "dist-stampede", time.Minute, func(_ context.Context) (string, error) {
 				callCount.Add(1)
 				time.Sleep(20 * time.Millisecond)
@@ -374,10 +388,8 @@ func TestGetOrSet_DistributedStampede(t *testing.T) {
 			})
 			assert.NoError(t, err)
 			assert.Equal(t, "dist-value", val)
-		}()
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		})
+		wg.Go(func() {
 			val, err := cache.GetOrSet(ctx, node2, "dist-stampede", time.Minute, func(_ context.Context) (string, error) {
 				callCount.Add(1)
 				time.Sleep(20 * time.Millisecond)
@@ -385,7 +397,7 @@ func TestGetOrSet_DistributedStampede(t *testing.T) {
 			})
 			assert.NoError(t, err)
 			assert.Equal(t, "dist-value", val)
-		}()
+		})
 	}
 	wg.Wait()
 
@@ -411,9 +423,7 @@ func TestGetOrSet_LockHolderCrash(t *testing.T) {
 	// Node1 acquires lock, sleeps past lock TTL AND past spin-wait deadline.
 	// Lock TTL=50ms (expires fast), fn sleeps 600ms (>500ms spin-wait cap).
 	// Node2's spin-wait exhausts -> falls through to fn.
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		val, err := cache.GetOrSet(ctx, node1, "crash-key", time.Minute, func(_ context.Context) (string, error) {
 			callCount.Add(1)
 			close(locked)
@@ -422,20 +432,18 @@ func TestGetOrSet_LockHolderCrash(t *testing.T) {
 		}, cache.GetOrSetOptions{LockTTL: 50 * time.Millisecond})
 		assert.NoError(t, err)
 		assert.Equal(t, "crash-recovered", val)
-	}()
+	})
 
 	<-locked
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		val, err := cache.GetOrSet(ctx, node2, "crash-key", time.Minute, func(_ context.Context) (string, error) {
 			callCount.Add(1)
 			return "crash-recovered", nil
 		}, cache.GetOrSetOptions{LockTTL: 50 * time.Millisecond})
 		assert.NoError(t, err)
 		assert.Equal(t, "crash-recovered", val)
-	}()
+	})
 
 	wg.Wait()
 

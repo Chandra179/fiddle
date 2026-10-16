@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"crypto/rand"
 	"time"
 )
 
@@ -10,6 +11,8 @@ const (
 	retryTimeout   = 50 * time.Millisecond
 	nilSentinel    = "\x00nil\x00"
 	lockSuffix     = ":lock"
+	// unlockTimeout bounds lock release, which runs even if ctx is cancelled.
+	unlockTimeout = time.Second
 )
 
 type GetOrSetOptions struct {
@@ -46,15 +49,23 @@ func GetOrSet(ctx context.Context, c Cache, key string, ttl time.Duration, fn fu
 		lockTTL = defaultLockTTL
 	}
 
-	ok, lockErr := c.SetNX(ctx, lockKey, lockKey, lockTTL)
+	// Random token identifies this holder, so release never deletes a lock
+	// re-acquired by someone else after ours expired (fn outlived LockTTL).
+	token := rand.Text()
+	ok, lockErr := c.SetNX(ctx, lockKey, token, lockTTL)
 	if lockErr != nil {
 		return "", lockErr
 	}
 
 	// Lock acquired — this goroutine is responsible for computing + caching.
 	// Guard: release lock on return so spin-waiters (or next caller) can proceed.
+	// Release survives caller cancellation so a cancelled request still frees it.
 	if ok {
-		defer func() { _ = c.Del(ctx, lockKey) }()
+		defer func() {
+			unlockCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), unlockTimeout)
+			defer cancel()
+			_, _ = c.DelIfValue(unlockCtx, lockKey, token)
+		}()
 
 		// Double-check cache: between initial miss and lock acquisition,
 		// another lock holder may have populated the key already.
