@@ -2,6 +2,7 @@ package kafka
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -17,9 +18,12 @@ import (
 var (
 	ErrProducerClosed = errors.New("kafka: producer is closed")
 	ErrConsumerClosed = errors.New("kafka: consumer is closed")
+	ErrDLQPublish     = errors.New("kafka: failed to publish to DLQ")
 )
 
 // Producer produces messages to Kafka topics.
+// Produce and SendMessage are asynchronous; SendToDLQ blocks until the broker
+// acknowledges the record and returns the produce error, if any.
 type Producer interface {
 	Produce(ctx context.Context, msg *Message) error
 	SendMessage(ctx context.Context, topic string, payload any) error
@@ -40,6 +44,7 @@ type HealthChecker interface {
 }
 
 // NewKafkaClient creates a Kafka client with the provided configuration.
+//
 // Deprecated: Use NewKafkaClientFromConfig for production use.
 func NewKafkaClient(slogInstance *slog.Logger, brokers []string, topics []string, groupID string) (*kgo.Client, error) {
 	cfg := DefaultConfig(brokers, groupID).
@@ -50,6 +55,10 @@ func NewKafkaClient(slogInstance *slog.Logger, brokers []string, topics []string
 
 // NewKafkaClientFromConfig creates a Kafka client from a Config struct.
 // This is the recommended way to create clients in production.
+//
+// When cfg.GroupID is set the client is created with kgo.BlockRebalanceOnPoll:
+// callers that poll the client directly must call AllowRebalance after handling
+// each poll. Consumer.Start does this for you.
 func NewKafkaClientFromConfig(ctx context.Context, cfg *Config) (*kgo.Client, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
@@ -103,6 +112,7 @@ func NewKafkaClientFromConfig(ctx context.Context, cfg *Config) (*kgo.Client, er
 			kgo.SessionTimeout(cfg.SessionTimeout),
 			kgo.HeartbeatInterval(cfg.HeartbeatInterval),
 			kgo.RebalanceTimeout(cfg.RebalanceTimeout),
+			kgo.BlockRebalanceOnPoll(),
 		)
 	}
 
@@ -112,8 +122,12 @@ func NewKafkaClientFromConfig(ctx context.Context, cfg *Config) (*kgo.Client, er
 	}
 
 	// TLS configuration
-	if cfg.TLSEnabled && cfg.TLSConfig != nil {
-		opts = append(opts, kgo.DialTLSConfig(cfg.TLSConfig))
+	if cfg.TLSEnabled {
+		tlsConfig := cfg.TLSConfig
+		if tlsConfig == nil {
+			tlsConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+		}
+		opts = append(opts, kgo.DialTLSConfig(tlsConfig))
 	}
 
 	// SASL authentication

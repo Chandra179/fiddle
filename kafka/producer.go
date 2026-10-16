@@ -54,17 +54,7 @@ func (p *producer) Produce(ctx context.Context, msg *Message) error {
 		return err
 	}
 
-	headers := make([]kgo.RecordHeader, 0, len(msg.Headers))
-	for k, v := range msg.Headers {
-		headers = append(headers, kgo.RecordHeader{Key: k, Value: []byte(v)})
-	}
-
-	record := &kgo.Record{
-		Topic:   msg.Topic,
-		Key:     []byte(msg.Key),
-		Value:   data,
-		Headers: headers,
-	}
+	record := buildRecord(msg, data)
 
 	callback := msg.Callback
 	if callback == nil {
@@ -88,27 +78,50 @@ func (p *producer) SendMessage(ctx context.Context, topic string, payload any) e
 	return p.Produce(ctx, &Message{Topic: topic, Payload: payload})
 }
 
-// SendToDLQ sends a message to the dead letter queue asynchronously.
+// SendToDLQ sends a message to the dead letter queue and waits for the broker
+// to acknowledge it.
 func (p *producer) SendToDLQ(ctx context.Context, originalTopic string, value []byte, key []byte, dlqErr error) error {
 	dlqTopic := originalTopic + ".dlq"
 
-	headers := map[string]string{
-		"origin_topic":  originalTopic,
-		"dlq_timestamp": time.Now().Format(time.RFC3339),
-		"dlq_error":     dlqErr.Error(),
+	errMsg := "unknown error"
+	if dlqErr != nil {
+		errMsg = dlqErr.Error()
 	}
 
-	var keyStr string
-	if len(key) > 0 {
-		keyStr = string(key)
-	}
+	record := buildRecord(&Message{
+		Topic: dlqTopic,
+		Key:   string(key),
+		Headers: map[string]string{
+			"origin_topic":  originalTopic,
+			"dlq_timestamp": time.Now().Format(time.RFC3339),
+			"dlq_error":     errMsg,
+		},
+	}, value)
 
-	return p.Produce(ctx, &Message{
-		Topic:   dlqTopic,
-		Payload: value,
-		Key:     keyStr,
-		Headers: headers,
-	})
+	if err := p.client.ProduceSync(ctx, record).FirstErr(); err != nil {
+		return fmt.Errorf("kafka: produce to %s: %w", dlqTopic, err)
+	}
+	return nil
+}
+
+// buildRecord converts msg into a record carrying the already-encoded value.
+func buildRecord(msg *Message, value []byte) *kgo.Record {
+	record := &kgo.Record{
+		Topic: msg.Topic,
+		Value: value,
+	}
+	// franz-go's default partitioner hashes any non-nil key, so an empty key
+	// must stay nil or every keyless message lands on the same partition.
+	if msg.Key != "" {
+		record.Key = []byte(msg.Key)
+	}
+	if len(msg.Headers) > 0 {
+		record.Headers = make([]kgo.RecordHeader, 0, len(msg.Headers))
+		for k, v := range msg.Headers {
+			record.Headers = append(record.Headers, kgo.RecordHeader{Key: k, Value: []byte(v)})
+		}
+	}
+	return record
 }
 
 func (p *producer) marshalPayload(payload any) ([]byte, error) {

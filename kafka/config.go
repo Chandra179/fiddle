@@ -17,12 +17,15 @@ type Config struct {
 
 	// Security - TLS
 	TLSEnabled bool
-	TLSConfig  *tls.Config
+	TLSConfig  *tls.Config // Default when nil and TLSEnabled: TLS 1.2+ with system roots
 
 	// Security - SASL
 	SASLMechanism string // PLAIN, SCRAM-SHA-256, SCRAM-SHA-512
 	SASLUsername  string
 	SASLPassword  string
+	// AllowPlaintextSASL permits SASL PLAIN without TLS, which sends credentials
+	// in cleartext. Only intended for local development.
+	AllowPlaintextSASL bool
 
 	// Producer tuning
 	RequiredAcks   RequiredAcks  // Default: AllISRAcks
@@ -150,6 +153,9 @@ func (c *Config) Validate() error {
 		}
 		if !validMechanisms[c.SASLMechanism] {
 			return errors.New("kafka: unsupported SASL mechanism: " + c.SASLMechanism)
+		}
+		if c.SASLMechanism == "PLAIN" && !c.TLSEnabled && !c.AllowPlaintextSASL {
+			return errors.New("kafka: SASL PLAIN requires TLS; enable TLS or set AllowPlaintextSASL")
 		}
 	}
 
