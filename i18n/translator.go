@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 
 	gotext "github.com/nicksnyder/go-i18n/v2/i18n"
@@ -15,6 +16,12 @@ type translator struct {
 	bundle         *gotext.Bundle
 	locales        []string
 	fallbackLocale string
+
+	// matcher maps any requested locale onto one of the loaded languages, so
+	// the localizer cache is keyed by a bounded set of supported tags rather
+	// than by caller-supplied strings (e.g. raw Accept-Language values).
+	matcher   language.Matcher
+	supported []language.Tag
 
 	// Cache localizers to prevent heavy allocations and parsing on every call
 	localizers   map[string]*gotext.Localizer
@@ -42,7 +49,7 @@ func NewTranslator(cfg Config) (Translator, error) {
 
 	defaultLang, err := language.Parse(cfg.DefaultLocale)
 	if err != nil {
-		return nil, fmt.Errorf("%w: invalid DefaultLocale %q: %v", ErrBundleLoad, cfg.DefaultLocale, err)
+		return nil, fmt.Errorf("%w: invalid DefaultLocale %q: %w", ErrBundleLoad, cfg.DefaultLocale, err)
 	}
 
 	bundle := gotext.NewBundle(defaultLang)
@@ -52,53 +59,65 @@ func NewTranslator(cfg Config) (Translator, error) {
 	for _, file := range cfg.MessageFiles {
 		mf, err := bundle.LoadMessageFile(file)
 		if err != nil {
-			return nil, fmt.Errorf("%w: failed to load %q: %v", ErrBundleLoad, file, err)
+			return nil, fmt.Errorf("%w: failed to load %q: %w", ErrBundleLoad, file, err)
 		}
-		locales = append(locales, mf.Tag.String())
+		if tag := mf.Tag.String(); !slices.Contains(locales, tag) {
+			locales = append(locales, tag)
+		}
 	}
+
+	// LanguageTags lists the default language first, which makes it the
+	// matcher's answer for unsupported locales.
+	supported := bundle.LanguageTags()
 
 	return &translator{
 		bundle:         bundle,
 		locales:        locales,
 		fallbackLocale: cfg.FallbackLocale,
-		localizers:     make(map[string]*gotext.Localizer),
+		matcher:        language.NewMatcher(supported),
+		supported:      supported,
+		localizers:     make(map[string]*gotext.Localizer, len(supported)),
 	}, nil
 }
 
-// getLocalizer handles the thread-safe retrieval or creation of a localizer
+// getLocalizer handles the thread-safe retrieval or creation of a localizer.
+// The cache key is the supported language the requested locale matches, so
+// the cache never holds more entries than there are loaded languages.
 func (t *translator) getLocalizer(locale string) (*gotext.Localizer, error) {
+	lang, err := language.Parse(locale)
+	if err != nil {
+		return nil, fmt.Errorf("%w: invalid locale %q: %w", ErrLocaleNotFound, locale, err)
+	}
+	_, idx, _ := t.matcher.Match(lang)
+	key := t.supported[idx].String()
+
 	// Fast path: check cache with a read lock
 	t.localizersMu.RLock()
-	loc, exists := t.localizers[locale]
+	loc, exists := t.localizers[key]
 	t.localizersMu.RUnlock()
 
 	if exists {
 		return loc, nil
 	}
 
-	// Slow path: parse and create with a write lock
+	// Slow path: create with a write lock
 	t.localizersMu.Lock()
 	defer t.localizersMu.Unlock()
 
 	// Double-check pattern in case another goroutine created it while we were waiting for the lock
-	if loc, exists := t.localizers[locale]; exists {
+	if loc, exists := t.localizers[key]; exists {
 		return loc, nil
 	}
 
-	lang, err := language.Parse(locale)
-	if err != nil {
-		return nil, fmt.Errorf("%w: invalid locale %q: %v", ErrLocaleNotFound, locale, err)
-	}
-
-	// Create the localizer with the requested language AND the fallback language
+	// Create the localizer with the matched language AND the fallback language
 	var newLoc *gotext.Localizer
-	if t.fallbackLocale != "" && t.fallbackLocale != locale {
-		newLoc = gotext.NewLocalizer(t.bundle, lang.String(), t.fallbackLocale)
+	if t.fallbackLocale != "" && t.fallbackLocale != key {
+		newLoc = gotext.NewLocalizer(t.bundle, key, t.fallbackLocale)
 	} else {
-		newLoc = gotext.NewLocalizer(t.bundle, lang.String())
+		newLoc = gotext.NewLocalizer(t.bundle, key)
 	}
 
-	t.localizers[locale] = newLoc
+	t.localizers[key] = newLoc
 	return newLoc, nil
 }
 
@@ -118,11 +137,10 @@ func (t *translator) T(_ context.Context, locale, messageID string, templateData
 
 	msg, err := localizer.Localize(lc)
 	if err != nil {
-		var notFound *gotext.MessageNotFoundErr
-		if errors.As(err, &notFound) {
-			return "", fmt.Errorf("%w: %v", ErrMessageNotFound, err)
+		if _, ok := errors.AsType[*gotext.MessageNotFoundErr](err); ok {
+			return "", fmt.Errorf("%w: %w", ErrMessageNotFound, err)
 		}
-		return "", fmt.Errorf("%w: %v", ErrBundleLoad, err)
+		return "", fmt.Errorf("%w: %w", ErrBundleLoad, err)
 	}
 
 	return msg, nil

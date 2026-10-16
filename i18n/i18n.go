@@ -17,9 +17,9 @@ type Config struct {
 	DefaultLocale string
 	// FallbackLocale is used when a key is missing in DefaultLocale. Optional.
 	FallbackLocale string
-	// MessageFiles are paths to JSON/TOML message files to load. At least one required.
+	// MessageFiles are paths to JSON message files to load. At least one required.
 	MessageFiles []string
-	// Format is the message file format: "json" (default) or "toml".
+	// Format is the message file format. Only "json" (the default) is supported.
 	Format string
 }
 
