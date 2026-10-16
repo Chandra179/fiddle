@@ -3,6 +3,8 @@ package oauth2
 import (
 	"context"
 	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -109,7 +111,7 @@ func TestManager_RegisterProvider_Concurrent(t *testing.T) {
 
 	// Register providers concurrently
 	done := make(chan bool, 3)
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		go func(idx int) {
 			provider := &MockProvider{name: "provider-" + string(rune('a'+idx))}
 			mgr.RegisterProvider(provider)
@@ -117,12 +119,12 @@ func TestManager_RegisterProvider_Concurrent(t *testing.T) {
 		}(i)
 	}
 
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		<-done
 	}
 
 	// Verify all providers registered via public API
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		name := "provider-" + string(rune('a'+i))
 		_, err := mgr.GetProvider(name)
 		assert.NoError(t, err, "provider %s should be registered", name)
@@ -188,7 +190,7 @@ func TestManager_GetAuthURL_GeneratesUniqueStates(t *testing.T) {
 
 	// Generate multiple auth URLs
 	states := make(map[string]bool)
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		authURL, err := manager.GetAuthURL("test-provider")
 		require.NoError(t, err)
 
@@ -368,4 +370,100 @@ func extractStateFromURL(url string) string {
 		}
 	}
 	return ""
+}
+
+func TestManager_GetAuthURLWithState(t *testing.T) {
+	manager, err := NewManager(context.Background(), &ManagerConfig{
+		CallbackHandler: mockCallbackHandler(&CallbackInfo{}, nil),
+	})
+	require.NoError(t, err)
+	t.Cleanup(manager.Cleanup)
+	manager.RegisterProvider(&MockProvider{name: "test-provider", authURL: "https://example.com/auth"})
+
+	authURL, state, err := manager.GetAuthURLWithState("test-provider")
+	require.NoError(t, err)
+	assert.Len(t, state, 64)
+	assert.Equal(t, state, extractStateFromURL(authURL))
+
+	_, _, err = manager.GetAuthURLWithState("missing")
+	assert.ErrorIs(t, err, ErrProviderNotFound)
+}
+
+func TestManager_GetAuthURL_StateStoreFull(t *testing.T) {
+	manager, err := NewManager(context.Background(), &ManagerConfig{
+		CallbackHandler: mockCallbackHandler(&CallbackInfo{}, nil),
+		MaxStateEntries: 2,
+	})
+	require.NoError(t, err)
+	t.Cleanup(manager.Cleanup)
+	manager.RegisterProvider(&MockProvider{name: "test-provider", authURL: "https://example.com/auth"})
+
+	for range 2 {
+		_, err := manager.GetAuthURL("test-provider")
+		require.NoError(t, err)
+	}
+	_, err = manager.GetAuthURL("test-provider")
+	assert.ErrorIs(t, err, ErrStateStoreFull)
+}
+
+func TestManager_HandleCallback_ConcurrentReplayExactlyOneWins(t *testing.T) {
+	ctx := context.Background()
+	manager, err := NewManager(ctx, &ManagerConfig{
+		CallbackHandler: mockCallbackHandler(&CallbackInfo{UserID: "u"}, nil),
+	})
+	require.NoError(t, err)
+	t.Cleanup(manager.Cleanup)
+	manager.RegisterProvider(&MockProvider{name: "test-provider", authURL: "https://example.com/auth"})
+
+	_, state, err := manager.GetAuthURLWithState("test-provider")
+	require.NoError(t, err)
+
+	const n = 50
+	var (
+		wg    sync.WaitGroup
+		start = make(chan struct{})
+		wins  atomic.Int32
+	)
+	for range n {
+		wg.Go(func() {
+			<-start
+			if _, err := manager.HandleCallback(ctx, "test-provider", "code", state); err == nil {
+				wins.Add(1)
+			} else {
+				assert.ErrorIs(t, err, ErrInvalidState)
+				assert.ErrorIs(t, err, ErrStateNotFound)
+			}
+		})
+	}
+	close(start)
+	wg.Wait()
+
+	assert.Equal(t, int32(1), wins.Load())
+}
+
+func TestManager_HandleCallback_ProviderErrorIsUnwrappable(t *testing.T) {
+	ctx := context.Background()
+	providerErr := errors.New("provider error")
+	manager, err := NewManager(ctx, &ManagerConfig{
+		CallbackHandler: mockCallbackHandler(&CallbackInfo{}, nil),
+	})
+	require.NoError(t, err)
+	t.Cleanup(manager.Cleanup)
+	manager.RegisterProvider(&MockProvider{
+		name: "test-provider",
+		handleCallback: func(ctx context.Context, code, state, nonce, codeVerifier string) (*UserInfo, *TokenSet, error) {
+			return nil, nil, providerErr
+		},
+	})
+
+	_, state, err := manager.GetAuthURLWithState("test-provider")
+	require.NoError(t, err)
+
+	_, err = manager.HandleCallback(ctx, "test-provider", "code", state)
+	assert.ErrorIs(t, err, ErrOAuth2Callback)
+	assert.ErrorIs(t, err, providerErr)
+
+	// A failed callback still consumes the state
+	_, err = manager.HandleCallback(ctx, "test-provider", "code", state)
+	assert.ErrorIs(t, err, ErrInvalidState)
 }

@@ -35,12 +35,16 @@ type ManagerConfig struct {
 	StateTimeout time.Duration
 	// CallbackHandler is invoked after successful OAuth2 authentication
 	CallbackHandler CallbackHandler
+	// MaxStateEntries caps pending (unredeemed) states held in memory.
+	// Zero uses DefaultMaxStateEntries.
+	MaxStateEntries int
 }
 
 // DefaultManagerConfig returns a secure default configuration
 func DefaultManagerConfig() *ManagerConfig {
 	return &ManagerConfig{
-		StateTimeout: 10 * time.Minute,
+		StateTimeout:    10 * time.Minute,
+		MaxStateEntries: DefaultMaxStateEntries,
 	}
 }
 
@@ -74,7 +78,7 @@ func NewManager(ctx context.Context, cfg *ManagerConfig) (Manager, error) {
 
 	mgr := &manager{
 		providers:       make(map[string]Provider),
-		stateStorage:    NewInMemoryStorage(),
+		stateStorage:    NewInMemoryStorageWithMaxEntries(cfg.MaxStateEntries),
 		callbackHandler: cfg.CallbackHandler,
 		stateTimeout:    cfg.StateTimeout,
 	}
@@ -117,37 +121,45 @@ func (m *manager) RegisterProvider(provider Provider) {
 // GetAuthURL generates authorization URL with state, nonce, and PKCE
 // This method is safe for concurrent use
 func (m *manager) GetAuthURL(providerName string) (string, error) {
+	authURL, _, err := m.GetAuthURLWithState(providerName)
+	return authURL, err
+}
+
+// GetAuthURLWithState generates authorization URL with state, nonce, and PKCE,
+// and also returns the state so the caller can bind it to the browser
+// This method is safe for concurrent use
+func (m *manager) GetAuthURLWithState(providerName string) (string, string, error) {
 	m.mu.RLock()
 	provider, exists := m.providers[providerName]
 	m.mu.RUnlock()
 
 	if !exists {
-		return "", ErrProviderNotFound
+		return "", "", ErrProviderNotFound
 	}
 
 	state, err := GenerateRandomString(32)
 	if err != nil {
-		return "", fmt.Errorf("failed to generate state: %w", err)
+		return "", "", fmt.Errorf("failed to generate state: %w", err)
 	}
 
 	nonce, err := GenerateRandomString(32)
 	if err != nil {
-		return "", fmt.Errorf("failed to generate nonce: %w", err)
+		return "", "", fmt.Errorf("failed to generate nonce: %w", err)
 	}
 
 	codeVerifier, err := GenerateCodeVerifier()
 	if err != nil {
-		return "", fmt.Errorf("failed to generate code verifier: %w", err)
+		return "", "", fmt.Errorf("failed to generate code verifier: %w", err)
 	}
 	codeChallenge := GenerateCodeChallenge(codeVerifier)
 
 	// Store state, nonce, and code verifier
 	expiresAt := time.Now().Add(m.stateTimeout)
 	if err := m.stateStorage.SaveState(state, nonce, codeVerifier, expiresAt); err != nil {
-		return "", fmt.Errorf("failed to save state: %w", err)
+		return "", "", fmt.Errorf("failed to save state: %w", err)
 	}
 
-	return provider.GetAuthURL(state, nonce, codeChallenge), nil
+	return provider.GetAuthURL(state, nonce, codeChallenge), state, nil
 }
 
 // HandleCallback handles OAuth2/OIDC callback and invokes the callback handler
@@ -162,22 +174,16 @@ func (m *manager) HandleCallback(ctx context.Context, providerName, code, state 
 		return nil, ErrProviderNotFound
 	}
 
-	stateData, err := m.stateStorage.GetStateData(state)
+	// Consume state atomically (one-time use): concurrent callbacks with the
+	// same state cannot both succeed, and a failed callback cannot be replayed
+	stateData, err := m.stateStorage.ConsumeState(state)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidState, err)
+		return nil, fmt.Errorf("%w: %w", ErrInvalidState, err)
 	}
-
-	// Delete state after retrieval (one-time use)
-	// Note: We delete even if callback fails to prevent replay attacks
-	defer func() {
-		if err := m.stateStorage.DeleteState(state); err != nil {
-			_ = err // Intentionally ignored - state cleanup is best effort
-		}
-	}()
 
 	userInfo, tokenSet, err := provider.HandleCallback(ctx, code, state, stateData.Nonce, stateData.CodeVerifier)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrOAuth2Callback, err)
+		return nil, fmt.Errorf("%w: %w", ErrOAuth2Callback, err)
 	}
 
 	// Invoke callback handler (already validated in constructor)
