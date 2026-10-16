@@ -13,12 +13,12 @@ Multi-module Go monorepo. Each subdirectory is its own Go module.
 | oauth2/ | `oauth2` | yes | no* — mock OIDC server |
 | i18n/ | `i18n` | yes | no — file-based only |
 | cryptoutil/ | `cryptoutil` | yes | no — pure Go only |
-| logger/ | `github.com/Chandra179/gosdk` | **no** | no |
+| logger/ | `github.com/Chandra179/gosdk` | yes | no |
 
 ## Commands
 
 ```bash
-# Has Makefile (all except logger)
+# Every module has a Makefile
 cd db/ && make test
 # -> go test -tags integration -v -count=1 -timeout 300s ./...
 
@@ -28,8 +28,8 @@ cd cache/ && go test -v -count=1 ./...
 # cryptoutil unit tests (pure Go, no Docker)
 cd cryptoutil/ && go test -v -count=1 ./...
 
-# logger (no Makefile, uses standard go module path)
-cd logger/ && go test -v ./...
+# logger (unit tests only; module path is github.com/Chandra179/gosdk)
+cd logger/ && make test
 ```
 
 - `logger` has an unusual module path (`github.com/Chandra179/gosdk`) that differs from its directory name and is not importable by sibling modules.
@@ -68,4 +68,4 @@ See `README.md`. Boilerplate: `go.mod` (simple name), `<name>.go` (public API), 
 - Error classification via sentinel functions: `db.IsTimeoutError(err)`, `db.IsDuplicateKeyError(err)` — driver-agnostic, handles wrapped errors.
 - `db.ConnectionConfig.QueryTimeout` is applied to every query unless the caller's context has a tighter deadline.
 - No golangci-lint config file found; `make test` runs tests only.
-- Go `1.26.1` across most modules; `i18n/` uses `1.23`.
+- Go `1.27.2` across all modules.

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Structure
 
-Multi-module monorepo — each subdirectory is an independent Go module with its own `go.mod`. Modules: `db/`, `cache/`, `kafka/`, `rabbitmq/`, `logger/`, `oauth2/`.
+Multi-module monorepo — each subdirectory is an independent Go module with its own `go.mod`. Modules: `db/`, `cache/`, `kafka/`, `rabbitmq/`, `logger/`, `oauth2/`, `i18n/`, `cryptoutil/`. All target Go 1.27.2.
 
 ## Commands
 
@@ -15,9 +15,9 @@ Each module is tested independently. Integration tests require Docker (testconta
 cd db/ && make test
 # Expands to: go test -tags integration -v -count=1 -timeout 300s ./...
 
-# Modules without a Makefile
+# Unit tests only (no Docker)
 cd cache/ && go test -v -count=1 ./...
-cd logger/ && go test -v ./...
+cd logger/ && make test
 ```
 
 ## Architecture

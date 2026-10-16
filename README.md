@@ -21,7 +21,7 @@ This is a utility project for Golang. Each module lives in its own subdirectory 
    ```
    module yourmodule
 
-   go 1.26.1
+   go 1.27.2
    ```
 
 3. **Public API file** (`yourmodule.go`) — define sentinel errors, interfaces, and config structs. Keep the public surface small; consumers should only need to import this package.
