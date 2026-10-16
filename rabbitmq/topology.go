@@ -2,6 +2,8 @@ package rabbitmq
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 )
@@ -24,10 +26,11 @@ func (tm *TopologyManager) DeclareQueue(config QueueConfig) (*amqp.Queue, error)
 	}
 	defer ch.Close()
 
-	// Add quorum queue argument if needed
-	args := config.Args
+	// Add quorum queue argument if needed. Clone so the caller's map (and
+	// the cached config) is never mutated.
+	args := maps.Clone(config.Args)
 	if args == nil {
-		args = make(map[string]interface{})
+		args = make(map[string]any)
 	}
 
 	if tm.client.config.QueueType == QueueTypeQuorum && config.Durable {
@@ -48,7 +51,9 @@ func (tm *TopologyManager) DeclareQueue(config QueueConfig) (*amqp.Queue, error)
 
 	// Cache the topology
 	tm.client.topology.mu.Lock()
-	tm.client.topology.queues = append(tm.client.topology.queues, config)
+	tm.client.topology.queues = upsert(tm.client.topology.queues, config, func(q QueueConfig) bool {
+		return config.Name != "" && q.Name == config.Name
+	})
 	tm.client.topology.mu.Unlock()
 
 	tm.client.logger.Info("queue declared", "queue", config.Name, "type", tm.client.config.QueueType)
@@ -78,7 +83,9 @@ func (tm *TopologyManager) DeclareExchange(config ExchangeConfig) error {
 
 	// Cache the topology
 	tm.client.topology.mu.Lock()
-	tm.client.topology.exchanges = append(tm.client.topology.exchanges, config)
+	tm.client.topology.exchanges = upsert(tm.client.topology.exchanges, config, func(e ExchangeConfig) bool {
+		return e.Name == config.Name
+	})
 	tm.client.topology.mu.Unlock()
 
 	tm.client.logger.Info("exchange declared", "exchange", config.Name, "type", config.Kind)
@@ -106,7 +113,9 @@ func (tm *TopologyManager) BindQueue(config BindingConfig) error {
 
 	// Cache the topology
 	tm.client.topology.mu.Lock()
-	tm.client.topology.bindings = append(tm.client.topology.bindings, config)
+	tm.client.topology.bindings = upsert(tm.client.topology.bindings, config, func(b BindingConfig) bool {
+		return b.QueueName == config.QueueName && b.Exchange == config.Exchange && b.RoutingKey == config.RoutingKey
+	})
 	tm.client.topology.mu.Unlock()
 
 	tm.client.logger.Info("queue bound",
@@ -115,6 +124,16 @@ func (tm *TopologyManager) BindQueue(config BindingConfig) error {
 		"routing_key", config.RoutingKey,
 	)
 	return nil
+}
+
+// upsert replaces the first element matching same with v, or appends v, so
+// repeated declarations do not grow the topology cache.
+func upsert[T any](s []T, v T, same func(T) bool) []T {
+	if i := slices.IndexFunc(s, same); i >= 0 {
+		s[i] = v
+		return s
+	}
+	return append(s, v)
 }
 
 // restoreTopology re-declares all cached topology after reconnection.
@@ -175,7 +194,7 @@ func (tm *TopologyManager) SetupDeadLetterExchange(mainQueueName, dlxName string
 
 	// Create retry queue
 	retryQueueName := mainQueueName + ".retry"
-	retryArgs := map[string]interface{}{
+	retryArgs := map[string]any{
 		"x-message-ttl":             retryTTL,
 		"x-dead-letter-exchange":    "",
 		"x-dead-letter-routing-key": mainQueueName,
@@ -226,7 +245,7 @@ func (tm *TopologyManager) SetupDeadLetterExchange(mainQueueName, dlxName string
 
 // SetupQueueWithDLX creates a main queue with DLX arguments
 func (tm *TopologyManager) SetupQueueWithDLX(queueName, dlxName string) (*amqp.Queue, error) {
-	args := map[string]interface{}{
+	args := map[string]any{
 		"x-dead-letter-exchange":    dlxName,
 		"x-dead-letter-routing-key": queueName,
 	}
