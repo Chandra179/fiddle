@@ -1,6 +1,8 @@
 package cryptoutil_test
 
 import (
+	"errors"
+	"strings"
 	"testing"
 
 	"cryptoutil"
@@ -64,7 +66,7 @@ func TestBcrypt_HashAndCompare(t *testing.T) {
 
 func TestBcrypt_InvalidCost(t *testing.T) {
 	_, err := cryptoutil.NewBcrypter(cryptoutil.BcryptConfig{Cost: 1})
-	if err != cryptoutil.ErrInvalidCost {
+	if !errors.Is(err, cryptoutil.ErrInvalidCost) {
 		t.Fatal("expected ErrInvalidCost, got:", err)
 	}
 }
@@ -133,5 +135,63 @@ func TestScrypt_Deterministic(t *testing.T) {
 	k2, _ := s.DeriveKey([]byte("password"), []byte("salt"))
 	if string(k1) != string(k2) {
 		t.Fatal("expected deterministic output")
+	}
+}
+
+func TestBcrypt_PasswordTooLong(t *testing.T) {
+	b, err := cryptoutil.NewBcrypter(cryptoutil.BcryptConfig{Cost: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = b.Hash(strings.Repeat("a", 73))
+	if !errors.Is(err, cryptoutil.ErrPasswordTooLong) {
+		t.Fatal("expected ErrPasswordTooLong, got:", err)
+	}
+}
+
+func TestScrypt_PartialConfigUsesDefaults(t *testing.T) {
+	// Only N set: R, P and KeyLen must fall back to defaults instead of
+	// failing at DeriveKey time.
+	s, err := cryptoutil.NewScrypter(cryptoutil.ScryptConfig{N: 1024})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := s.DeriveKey([]byte("password"), []byte("salt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(key) != 32 {
+		t.Fatalf("expected default 32-byte key, got %d", len(key))
+	}
+}
+
+func TestScrypt_InvalidParams(t *testing.T) {
+	cases := []cryptoutil.ScryptConfig{
+		{N: 1024, R: 1 << 15, P: 1 << 15},
+		{N: 1024, KeyLen: 8},
+		{N: 1024, R: -1},
+	}
+	for _, cfg := range cases {
+		if _, err := cryptoutil.NewScrypter(cfg); !errors.Is(err, cryptoutil.ErrInvalidParams) {
+			t.Fatalf("cfg %+v: expected ErrInvalidParams, got %v", cfg, err)
+		}
+	}
+}
+
+func TestScrypt_VerifyKey(t *testing.T) {
+	s, err := cryptoutil.NewScrypter(cryptoutil.ScryptConfig{N: 1024})
+	if err != nil {
+		t.Fatal(err)
+	}
+	salt := []byte("somesalt")
+	key, err := s.DeriveKey([]byte("password"), salt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.VerifyKey([]byte("password"), salt, key); err != nil {
+		t.Fatal("expected match, got:", err)
+	}
+	if err := s.VerifyKey([]byte("wrong"), salt, key); !cryptoutil.IsMismatchedHash(err) {
+		t.Fatal("expected mismatch, got:", err)
 	}
 }
