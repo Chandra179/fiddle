@@ -108,16 +108,19 @@ func readCookie(r *http.Request, name string) (string, bool) {
 	return value, true
 }
 
-// GoogleLoginHandler starts the Google OAuth2 flow
-// It stores the state in an HTTP-only cookie (checked by GoogleCallbackHandler)
-// and redirects the browser to the provider
-// The handler does not check the HTTP method; register it for GET. It is a
-// plain net/http handler: mux.Handle("GET /auth/login/google", h), or with gin
-// router.GET(path, gin.WrapF(h))
+// GoogleLoginHandler starts the Google OAuth2 flow: it stores the state in an
+// HTTP-only cookie (checked by GoogleCallbackHandler) and redirects the browser
+// to the provider.
+//
+// It does not check the HTTP method, so register it for GET:
+// mux.Handle("GET /auth/login/google", h), or with gin
+// router.GET(path, gin.WrapF(h)).
+//
 // @Summary Google OAuth2 login
 // @Description Redirects to Google's authorization endpoint
 // @Tags oauth2
 // @Success 302 "Redirect to provider"
+// @Failure 400 {object} map[string]string "Bad Request - provider not found"
 // @Failure 503 {object} map[string]string "Service Unavailable - too many pending logins"
 // @Failure 500 {object} map[string]string "Internal Server Error"
 // @Router /auth/login/google [get]
@@ -146,13 +149,15 @@ func GoogleLoginHandler(manager Manager, config *HandlerConfig) http.HandlerFunc
 	}
 }
 
-// GoogleCallbackHandler handles Google OAuth2 callback
-// The state query parameter must match the state cookie set by GoogleLoginHandler
-// Note: This handler sets secure HTTP-only cookies for session management
-// The session cookie value is URL-escaped (see setCookie)
-// The handler does not check the HTTP method; register it for GET. It is a
-// plain net/http handler: mux.Handle("GET /auth/callback/google", h), or with
-// gin router.GET(path, gin.WrapF(h))
+// GoogleCallbackHandler handles the Google OAuth2 callback. The state query
+// parameter must match the state cookie set by GoogleLoginHandler. On success it
+// sets the session as an HTTP-only cookie whose value is URL-escaped (see
+// setCookie).
+//
+// It does not check the HTTP method, so register it for GET:
+// mux.Handle("GET /auth/callback/google", h), or with gin
+// router.GET(path, gin.WrapF(h)).
+//
 // @Summary Google OAuth2 callback
 // @Description Handles Google OAuth2 callback and returns user info
 // @Tags oauth2

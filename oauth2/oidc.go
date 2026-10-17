@@ -248,7 +248,7 @@ func (p *OIDCProvider) RefreshToken(ctx context.Context, refreshToken string) (*
 		ExpiresAt:    newToken.Expiry,
 	}
 
-	// Preserve existing ID token if refresh doesn't return one
+	// A refresh response may omit the ID token.
 	if idToken, ok := newToken.Extra("id_token").(string); ok && idToken != "" {
 		tokenSet.IDToken = idToken
 	}

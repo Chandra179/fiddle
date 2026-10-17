@@ -79,7 +79,7 @@ func (h *healthChecker) CheckWithMetadata(ctx context.Context) (*ClusterHealth, 
 	return health, nil
 }
 
-// LivenessCheck is a convenience function for Kubernetes liveness probes.
+// LivenessCheck is Check with a 5 second timeout, for liveness probes.
 func (h *healthChecker) LivenessCheck(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()

@@ -23,7 +23,7 @@ type translator struct {
 	matcher   language.Matcher
 	supported []language.Tag
 
-	// Cache localizers to prevent heavy allocations and parsing on every call
+	// Localizers are cached to avoid rebuilding them on every call.
 	localizers   map[string]*gotext.Localizer
 	localizersMu sync.RWMutex
 }
@@ -37,14 +37,11 @@ func NewTranslator(cfg Config) (Translator, error) {
 		return nil, fmt.Errorf("%w: at least one MessageFile is required", ErrBundleLoad)
 	}
 
-	// Default to JSON
 	if cfg.Format == "" {
 		cfg.Format = "json"
 	}
 	if cfg.Format != "json" {
-		// Keeping it strictly JSON for this constructor to ensure it works out of the box.
-		// If you need TOML, create a separate NewTomlTranslator or pass the unmarshal func in Config.
-		return nil, fmt.Errorf("%w: unsupported format %q (only 'json' is supported here)", ErrBundleLoad, cfg.Format)
+		return nil, fmt.Errorf("%w: unsupported format %q (only 'json' is supported)", ErrBundleLoad, cfg.Format)
 	}
 
 	defaultLang, err := language.Parse(cfg.DefaultLocale)
@@ -104,12 +101,12 @@ func (t *translator) getLocalizer(locale string) (*gotext.Localizer, error) {
 	t.localizersMu.Lock()
 	defer t.localizersMu.Unlock()
 
-	// Double-check pattern in case another goroutine created it while we were waiting for the lock
+	// Check again: another goroutine may have created it while we waited.
 	if loc, exists := t.localizers[key]; exists {
 		return loc, nil
 	}
 
-	// Create the localizer with the matched language AND the fallback language
+	// The localizer tries the matched language first, then the fallback.
 	langs := []string{key}
 	if t.fallbackLocale != "" && t.fallbackLocale != key {
 		langs = append(langs, t.fallbackLocale)

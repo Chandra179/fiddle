@@ -24,9 +24,9 @@ type CallbackInfo struct {
 	CookieMaxAge      int
 }
 
-// CallbackHandler is invoked after successful OAuth2 authentication
-// It receives the provider name, user info, and token set
-// Returns custom data that can be used by the caller (e.g., session data)
+// CallbackHandler is called after a successful login with the provider name,
+// user info and tokens. It returns the session details the HTTP handler turns
+// into a cookie.
 type CallbackHandler func(ctx context.Context, provider string, userInfo *UserInfo, tokenSet *TokenSet) (*CallbackInfo, error)
 
 // ManagerConfig contains configuration for the OAuth2 manager
@@ -75,7 +75,8 @@ func NewManager(cfg *ManagerConfig) (Manager, error) {
 	}, nil
 }
 
-// NewManagerWithGoogle creates a new manager with Google provider configured
+// NewManagerWithGoogle is NewManager plus a registered "google" provider. If the
+// client ID or secret is empty, no provider is registered.
 func NewManagerWithGoogle(ctx context.Context, cfg *ManagerConfig, googleClientID, googleClientSecret, googleRedirectURL string) (Manager, error) {
 	mgr, err := NewManager(cfg)
 	if err != nil {
@@ -134,8 +135,8 @@ func (m *manager) GetAuthURLWithState(providerName string) (string, string, erro
 	return provider.GetAuthURL(state, nonce, codeChallenge), state, nil
 }
 
-// HandleCallback handles OAuth2/OIDC callback and invokes the callback handler
-// Returns userInfo, tokenSet, and any custom result from the callback handler
+// HandleCallback consumes the state, completes the login with the provider and
+// returns what the CallbackHandler returned.
 // This method is safe for concurrent use
 func (m *manager) HandleCallback(ctx context.Context, providerName, code, state string) (*CallbackInfo, error) {
 	m.mu.RLock()

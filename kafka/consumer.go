@@ -55,13 +55,13 @@ func NewConsumer(client *kgo.Client, opts ...ConsumerOptions) Consumer {
 // Start begins consuming messages and processing them with the handler.
 // It blocks until the context is cancelled or the client is closed.
 //
-// Offsets of processed records are committed once per poll, so records that were
-// still in flight at shutdown stay uncommitted and are redelivered on restart
-// (at-least-once delivery). If a DLQ producer is
-// configured and publishing a failed record to it fails, Start returns an error
-// wrapping ErrDLQPublish without committing that record or any later one.
-// The client has already fetched past those records, so close it (leaving the
-// group) and create a new one; the uncommitted records are then redelivered.
+// Offsets of processed records are committed once per poll, so records still in
+// flight at shutdown are redelivered on restart (at-least-once).
+//
+// If publishing a failed record to the DLQ fails, Start returns an error
+// wrapping ErrDLQPublish without committing that record or any later one. The
+// client has already fetched past them, so close it and create a new one to have
+// them redelivered.
 func (c *consumer) Start(ctx context.Context, handler Handler) error {
 	for {
 		if err := ctx.Err(); err != nil {

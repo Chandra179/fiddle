@@ -65,7 +65,7 @@ func TestInMemoryStorage_ConcurrentAccess(t *testing.T) {
 	}
 	wg.Wait()
 
-	// Concurrent reads
+	// Concurrent consumes
 	wg.Add(numGoroutines)
 	for i := range numGoroutines {
 		go func(idx int) {

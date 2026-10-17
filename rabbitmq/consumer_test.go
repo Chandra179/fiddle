@@ -325,8 +325,7 @@ func TestHandleFailedDelivery(t *testing.T) {
 }
 
 // A handler that always fails must reach the parking lot after MaxRetries
-// retries on a queue with no broker-side counter and no DLX: the loop that
-// RetryEnabled=false used to leave unbounded.
+// retries, even on a queue with no broker-side counter and no DLX.
 func TestHandleFailedDelivery_BoundsUnboundedRequeueLoop(t *testing.T) {
 	cfg := &Config{MaxRetries: 2, DeadLetterEnabled: true}
 	pub := &fakeRepublisher{}

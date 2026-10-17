@@ -264,7 +264,10 @@ func (c *Client) consumerConnClosed() bool {
 	return c.consumerConn == nil || c.consumerConn.IsClosed()
 }
 
-// SetupDeadLetterExchange creates a DLX with retry and parking lot queues
+// SetupDeadLetterExchange declares the dead-letter exchange dlxName, the retry
+// queue "<main>.retry" and the parking-lot queue "<main>.parking-lot". Messages
+// dead-lettered with the main queue's name as routing key wait retryTTL
+// milliseconds in the retry queue, then return to the main queue.
 func (tm *TopologyManager) SetupDeadLetterExchange(mainQueueName, dlxName string, retryTTL int) error {
 	// Create the dead letter exchange
 	if err := tm.DeclareExchange(ExchangeConfig{
@@ -309,7 +312,7 @@ func (tm *TopologyManager) SetupDeadLetterExchange(mainQueueName, dlxName string
 		return fmt.Errorf("failed to declare parking lot queue: %w", err)
 	}
 
-	// Bind parking lot queue to DLX with different routing
+	// Bind the parking lot too, so the DLX can route messages into it
 	if err := tm.BindQueue(BindingConfig{
 		QueueName:  parkingLotName,
 		Exchange:   dlxName,
@@ -326,7 +329,8 @@ func (tm *TopologyManager) SetupDeadLetterExchange(mainQueueName, dlxName string
 	return nil
 }
 
-// SetupQueueWithDLX creates a main queue with DLX arguments
+// SetupQueueWithDLX declares queueName with dlxName as its dead-letter exchange,
+// using the queue name as the dead-letter routing key.
 func (tm *TopologyManager) SetupQueueWithDLX(queueName, dlxName string) (*amqp.Queue, error) {
 	args := map[string]any{
 		"x-dead-letter-exchange":    dlxName,

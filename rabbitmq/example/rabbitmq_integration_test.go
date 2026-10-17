@@ -365,7 +365,7 @@ func TestConsumer_ManualAck(t *testing.T) {
 
 		select {
 		case <-handlerCalled:
-			// Handler was called and returned an error — message should be requeued
+			// The handler ran and returned an error; the retry policy settles the message
 		case <-time.After(10 * time.Second):
 			t.Fatal("timeout waiting for handler call")
 		}
@@ -700,9 +700,9 @@ func TestClient_CloseTwice(t *testing.T) {
 	assert.False(t, client.IsHealthy())
 }
 
-// With RetryEnabled=false a failing handler used to requeue the message with
-// nothing counting the attempts on a classic queue. The client now counts them
-// itself and parks the message after MaxRetries.
+// With RetryEnabled=false the client counts the attempts itself, so a failing
+// handler on a classic queue parks the message after MaxRetries instead of
+// looping forever.
 func TestConsumer_ClassicQueueWithoutRetryEnabledIsBounded(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -879,8 +879,7 @@ func TestConsumer_RetryBackoffSpacesAttempts(t *testing.T) {
 	assert.GreaterOrEqual(t, times[2].Sub(times[1]), 2*backoff, "second retry waits twice as long")
 }
 
-// A per-message TTL must survive a counted retry; the copy used to lose it and
-// would then never expire.
+// A per-message TTL must survive a counted retry, or the copy would never expire.
 func TestConsumer_RetryKeepsExpiration(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()

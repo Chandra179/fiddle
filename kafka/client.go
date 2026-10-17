@@ -29,15 +29,13 @@ type Producer interface {
 
 // Handler processes one consumed record.
 //
-// ctx is cancelled when the context given to Consumer.Start is, so a handler
-// that blocks (HTTP call, database query) can stop promptly on shutdown. When
-// the client was created with Config.EnableOTel, ctx also carries the span of
-// the record's receive operation, so spans started from it join the producer's
-// trace.
+// ctx is cancelled when the context given to Consumer.Start is, so a blocking
+// handler can stop on shutdown. With Config.EnableOTel it also carries the
+// record's receive span, so spans started from it join the producer's trace.
 //
-// A non-nil error is retried (see ConsumerOptions.MaxRetries) and then sent to
-// the DLQ. The error text is published in the DLQ record's dlq_error header,
-// see WithDLQErrorFormatter.
+// A non-nil error is retried (ConsumerOptions.MaxRetries) and then sent to the
+// DLQ. The record's dlq_error header holds the error's class or type, not its
+// message (see WithDLQClass and WithDLQErrorFormatter).
 type Handler func(ctx context.Context, record *kgo.Record) error
 
 // Consumer consumes messages from Kafka topics.
@@ -191,19 +189,16 @@ func buildSASLOpt(cfg *Config) (kgo.Opt, error) {
 	}
 }
 
-// SlogShim adapts *slog.Logger to the kgo.Logger interface.
-//
-// franz-go logs from client background goroutines (heartbeats, metadata
-// refreshes, reconnects) that belong to no caller's request, and kgo.Logger
-// carries no context, so records are logged with context.Background().
+// SlogShim adapts *slog.Logger to the kgo.Logger interface. kgo.Logger carries
+// no context and franz-go logs from background goroutines unrelated to any
+// request, so records are logged with context.Background().
 type SlogShim struct {
 	L *slog.Logger
 }
 
-// Level reports the most verbose level the underlying logger has enabled, so
-// franz-go debug logs appear when (and only when) the slog handler accepts
-// debug records. It is evaluated on every call, so it follows a slog.LevelVar
-// that changes at runtime.
+// Level reports the most verbose level the underlying logger enables, so
+// franz-go debug logs appear only when the slog handler accepts them. It is
+// evaluated on every call, so a changing slog.LevelVar is followed.
 func (s *SlogShim) Level() kgo.LogLevel {
 	ctx := context.Background()
 	switch {

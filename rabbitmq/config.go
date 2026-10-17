@@ -120,16 +120,12 @@ func NewDefaultConfig() *Config {
 	}
 }
 
-// ApplyDefaults sets every zero-valued field that has a default in
-// NewDefaultConfig: ConnectionName, ChannelPoolSize, PrefetchCount, QueueType,
-// RetryBackoff, MaxRetries, ReconnectInitialInterval and ReconnectMaxInterval.
-// For RetryBackoff and MaxRetries an explicit negative value is kept and means
-// "none" (see Config); for the other fields a negative value is left alone so
-// Validate rejects it. Because zero means "unset", an explicit zero cannot be
-// expressed: MaxRetries: 0 becomes DefaultMaxRetries.
-//
-// Boolean fields cannot be told apart from unset ones and are never touched;
-// start from NewDefaultConfig to get its boolean defaults. URL has no default.
+// ApplyDefaults replaces zero-valued fields with their NewDefaultConfig values:
+// ConnectionName, ChannelPoolSize, PrefetchCount, QueueType, RetryBackoff,
+// MaxRetries, ReconnectInitialInterval and ReconnectMaxInterval. Zero means
+// "unset", so MaxRetries: 0 becomes DefaultMaxRetries; a negative RetryBackoff
+// or MaxRetries is kept and means "none". Other negative values are left for
+// Validate to reject. Booleans and URL are never touched.
 func (c *Config) ApplyDefaults() {
 	def := NewDefaultConfig()
 

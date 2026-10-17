@@ -297,11 +297,10 @@ func retryDelay(base time.Duration, retryCount int) time.Duration {
 	return min(d, maxRetryDelay)
 }
 
-// waitBeforeRetry sleeps for the backoff that the counted-retry path owes the
-// deliveries ds, which is the longest one any of them needs. It returns at once
-// when RetryEnabled (the retry queue's TTL is the delay), when the backoff is
-// disabled, or when none of ds will be retried. It returns ctx's error if ctx
-// ends first.
+// waitBeforeRetry sleeps for the longest backoff any of ds needs before its
+// counted retry. It returns at once when RetryEnabled (the retry queue's TTL is
+// the delay), when the backoff is disabled, or when none of ds will be retried,
+// and returns ctx's error if ctx ends first.
 func waitBeforeRetry(ctx context.Context, cfg *Config, queue string, ds ...amqp.Delivery) error {
 	if cfg.RetryEnabled {
 		return nil
@@ -336,8 +335,8 @@ func waitBeforeRetry(ctx context.Context, cfg *Config, queue string, ds ...amqp.
 //     type;
 //   - at MaxRetries: settleExhausted.
 //
-// Rejecting at MaxRetries is not enough on its own: the DLX routes by the main
-// queue name, which leads back into the retry queue rather than the parking lot.
+// At MaxRetries a reject would not reach the parking lot: the DLX routes by the
+// main queue's name, which leads back to the retry queue.
 func handleFailedDelivery(ctx context.Context, cfg *Config, logger *slog.Logger, republish republishFunc, d amqp.Delivery, queue string) {
 	retryCount := getRetryCount(d, queue)
 
@@ -519,7 +518,7 @@ func toInt(v any) (int, bool) {
 	}
 }
 
-// ConsumeWithDefaults starts consuming with sensible defaults.
+// ConsumeWithDefaults consumes queueName with manual acks and no auto-reconnect.
 func (c *Consumer) ConsumeWithDefaults(ctx context.Context, queueName string, handler MessageHandler) error {
 	return c.StartConsumer(ctx, ConsumeOptions{
 		QueueName: queueName,
@@ -577,8 +576,8 @@ func WithBatchValidator(validate func(amqp.Delivery) error) BatchOption {
 	return func(bc *BatchConsumer) { bc.validate = validate }
 }
 
-// BatchConsumer handles batch message consumption.
-// It manages its own AMQP channel and ack lifecycle, avoiding double-ack issues.
+// BatchConsumer consumes in batches. It owns its channel and acks a whole batch
+// at once.
 type BatchConsumer struct {
 	client       *Client
 	logger       *slog.Logger
@@ -603,8 +602,9 @@ func NewBatchConsumer(client *Client, logger *slog.Logger, batchSize int, flushT
 	return bc
 }
 
-// StartBatchConsumer starts consuming messages in batches.
-// It creates its own channel and handles acking per-batch to avoid double-ack.
+// StartBatchConsumer consumes opts.QueueName in batches of the configured size,
+// flushing a partial batch after the flush timeout. It returns when ctx ends or
+// the delivery channel closes.
 func (bc *BatchConsumer) StartBatchConsumer(ctx context.Context, opts ConsumeOptions, handler BatchHandler) error {
 	ch, deliveries, err := bc.consume(opts)
 	if err != nil {
@@ -741,8 +741,7 @@ func (b *batcher) flush(ctx context.Context) error {
 	b.pending = nil
 
 	if err := b.handler(ctx, batch); err != nil {
-		// Apply the retry policy per message so a failing batch cannot
-		// hot-loop through immediate requeues, after one backoff for the batch.
+		// One backoff for the whole batch, then the retry policy per message.
 		if werr := waitBeforeRetry(ctx, b.bc.client.config, b.queue, batch...); werr != nil {
 			b.bc.logger.Warn("retry wait interrupted, leaving batch unacked", "queue", b.queue, "error", werr)
 			return fmt.Errorf("batch handler error: %w", err)

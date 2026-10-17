@@ -21,25 +21,16 @@ type postgresClient struct {
 	config ConnectionConfig
 }
 
-// NewPostgresClient creates a new PostgreSQL database client with the given DSN
-// and connection pool configuration. The connection is verified with a ping
-// before returning, so a non-nil return value is ready to use.
+// NewPostgresClient connects to PostgreSQL (pgx through database/sql) and pings
+// it, so a non-nil result is ready to use. The ping stops when ctx is done and is
+// bounded by ConnectionConfig.PingTimeout; ctx is not kept after the call.
+// The caller must Close the client.
 //
-// The driver is pgx through database/sql. By default pgx prepares and caches
-// statements per connection, which a transaction-pooling proxy such as PgBouncer
-// cannot serve (a statement is prepared on one server connection and run on
-// another, failing with "prepared statement ... already exists" or "does not
-// exist"). Behind such a proxy add default_query_exec_mode=exec (or
-// cache_describe, simple_protocol) to the DSN, for example
+// pgx caches prepared statements per connection by default, which PgBouncer in
+// transaction-pooling mode cannot serve. Behind such a proxy add
+// default_query_exec_mode=exec (or cache_describe, simple_protocol) to the DSN:
 //
 //	postgres://user:pass@pgbouncer:6432/app?default_query_exec_mode=exec
-//
-// ctx cancels the startup ping, which is also bounded by
-// ConnectionConfig.PingTimeout (DefaultPingTimeout when unset). ctx is not
-// retained: it has no effect on the returned client after this call.
-//
-// The caller is responsible for calling Close() when the client is no longer
-// needed (typically at process shutdown).
 func NewPostgresClient(ctx context.Context, dsn string, config ConnectionConfig) (DB, error) {
 	db, err := sql.Open("pgx", dsn)
 	if err != nil {
@@ -149,8 +140,7 @@ func (c *postgresClient) WithTransaction(
 	isolationLevel sql.IsolationLevel,
 	fn func(ctx context.Context, tx DBTX) error,
 ) error {
-	// The context governs the transaction until it is committed or rolled
-	// back, so it is released only when this call returns.
+	// The transaction lives as long as ctx, so cancel only when we return.
 	ctx, cancel := withTimeout(ctx, c.config.TxTimeout)
 	defer cancel()
 
@@ -167,10 +157,9 @@ func (c *postgresClient) WithTransaction(
 	}()
 
 	if err := fn(ctx, tx); err != nil {
-		// When ctx has ended, database/sql aborts the transaction itself and the
-		// driver drops the connection, so Rollback fails with ErrTxDone or a
-		// closed-connection error whatever happened: the server discards the
-		// transaction either way, and the original error is the one to report.
+		// Once ctx has ended, database/sql aborts the transaction and Rollback
+		// fails whatever happened; the server discards it either way, so report
+		// the original error.
 		if rbErr := tx.Rollback(); rbErr != nil && ctx.Err() == nil && !errors.Is(rbErr, sql.ErrTxDone) {
 			return fmt.Errorf("transaction failed: %w, rollback also failed: %w", err, rbErr)
 		}
@@ -196,10 +185,8 @@ func (c *postgresClient) PingContext(ctx context.Context) error {
 
 // ---- Error classification helpers ------------------------------------------
 //
-// These helpers are intentionally separate from the sentinel errors so callers
-// can decide how to handle driver-level errors without importing pgx
-// themselves. They fall back to string matching when the error is not a
-// *pgconn.PgError (e.g. errors from other drivers).
+// These let callers classify driver errors without importing pgx. They match
+// *pgconn.PgError codes and fall back to the error message for other errors.
 
 // Driver-agnostic fallbacks: lower-case substrings of an error message.
 var (

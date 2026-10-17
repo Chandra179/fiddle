@@ -25,18 +25,14 @@ type GetOrSetOptions struct {
 	CacheNil bool
 }
 
-// GetOrSet implements cache-aside (lazy-load) with stampede protection.
-// On cache miss: acquires distributed lock -> calls fn -> stores result -> returns.
-// Concurrent callers for same key spin-wait up to ~500ms for leader to populate cache,
-// falling back to fn call if lock holder crashed or lock TTL too short.
+// GetOrSet is cache-aside with stampede protection. On a miss one caller takes a
+// lock, runs fn and stores the result; concurrent callers for the same key wait
+// up to waitTimeout for it, then run fn themselves (the holder crashed or its
+// lock TTL was too short).
 //
-// Use when: fn is expensive (DB query, API call), TTL-bound staleness acceptable,
-// multiple goroutines/machines may request same key concurrently.
-//
-// Not for: write-through / write-behind caching, transactional cache+DB consistency,
-// streaming data, hot keys that change every ms (lock contention overhead).
-//
-// Stampede protection: only 1 caller executes fn per key at a time.
+// Use it when fn is expensive, brief staleness is fine, and many goroutines or
+// machines may ask for the same key. It is not for write-through caching,
+// cache+DB transactions, or keys that change every few milliseconds.
 func GetOrSet(ctx context.Context, c Cache, key string, ttl time.Duration, fn func(context.Context) (string, error), opts ...GetOrSetOptions) (string, error) {
 	o := defaultGetOrSetOpts(opts...)
 

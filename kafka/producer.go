@@ -50,11 +50,9 @@ func WithProducerLogger(logger *slog.Logger) ProducerOption {
 // WithDLQErrorFormatter sets how the error that sent a record to the DLQ is
 // rendered into the record's dlq_error header. Return "" to omit the header.
 //
-// The default is DLQErrorType, which never writes the error message (tag
-// errors with WithDLQClass to give DLQ consumers something to triage on). Use
-// DLQErrorMessage to include the (truncated) text, or your own function to
-// redact it, but only when handler errors cannot carry secrets or PII: the
-// header is readable by everyone who can read the DLQ topic.
+// The default, DLQErrorType, never writes the error message. Use
+// DLQErrorMessage or your own function to include text, only if handler errors
+// cannot carry secrets or PII: everyone who can read the DLQ topic can read it.
 func WithDLQErrorFormatter(format func(error) string) ProducerOption {
 	return func(p *producer) {
 		if format != nil {
@@ -79,13 +77,11 @@ func (e *classedError) Error() string    { return e.err.Error() }
 func (e *classedError) Unwrap() error    { return e.err }
 func (e *classedError) DLQClass() string { return e.class }
 
-// WithDLQClass tags err with a stable class such as "db_timeout" or
-// "invalid_payload". When the record is dead-lettered, the default formatter
-// (DLQErrorType) writes this class into dlq_error and nothing else, so DLQ
-// consumers can triage failures without the error message ever leaving the
-// service. Only the class is published: keep it free of request data. The
-// returned error still behaves like err (message, errors.Is and errors.As). A
-// nil err stays nil.
+// WithDLQClass tags err with a short class such as "db_timeout". When the record
+// is dead-lettered, the default formatter writes only this class into
+// dlq_error, so DLQ consumers can triage failures without the message leaving
+// the service. Keep the class free of request data. The returned error still
+// works with errors.Is and errors.As; a nil err stays nil.
 func WithDLQClass(err error, class string) error {
 	if err == nil {
 		return nil
@@ -94,10 +90,8 @@ func WithDLQClass(err error, class string) error {
 }
 
 // DLQErrorType is the default dlq_error formatter. It never writes the error
-// message, which handlers may fill with request data. It reports the class set
-// with WithDLQClass if any error in the chain carries one, and otherwise the Go
-// type of the root cause (for example "*pgconn.PgError"), found by following
-// Unwrap.
+// message. It returns the class set with WithDLQClass if the chain has one,
+// otherwise the Go type of the root cause (for example "*pgconn.PgError").
 func DLQErrorType(err error) string {
 	if tagged, ok := errors.AsType[dlqClassed](err); ok {
 		return tagged.DLQClass()
@@ -120,10 +114,9 @@ func DLQErrorType(err error) string {
 	}
 }
 
-// DLQErrorMessage is a dlq_error formatter that writes err.Error(), cut to 512
-// bytes without splitting a UTF-8 sequence. Opt in with
-// WithDLQErrorFormatter(DLQErrorMessage) only when handler errors never carry
-// secrets or PII.
+// DLQErrorMessage is a dlq_error formatter that writes err.Error() cut to 512
+// bytes. Opt in with WithDLQErrorFormatter(DLQErrorMessage) only when handler
+// errors never carry secrets or PII.
 func DLQErrorMessage(err error) string {
 	msg := err.Error()
 	if len(msg) <= maxDLQErrorLen {
@@ -180,7 +173,7 @@ func (p *producer) SendMessage(ctx context.Context, topic string, payload any) e
 	return p.Produce(ctx, &Message{Topic: topic, Payload: payload})
 }
 
-// SendToDLQ sends a message to the dead letter queue and waits for the broker
+// SendToDLQ publishes a record to originalTopic+".dlq" and waits for the broker
 // to acknowledge it.
 func (p *producer) SendToDLQ(ctx context.Context, originalTopic string, value []byte, key []byte, dlqErr error) error {
 

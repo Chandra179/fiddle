@@ -47,8 +47,8 @@ type argon2idHasher struct {
 // the recommended choice for new password storage.
 //
 // Zero-valued fields of cfg are filled from DefaultArgon2idConfig. It returns
-// ErrInvalidParams when Time or Threads is out of range, KeyLen < 16, or
-// Memory < 8*Threads KiB.
+// ErrInvalidParams when Memory < 8*Threads KiB, KeyLen is under 16 or over
+// 1024, or the cost exceeds the limits Verify enforces.
 func NewArgon2idHasher(cfg Argon2idConfig) (PasswordHasher, error) {
 	def := DefaultArgon2idConfig()
 	cfg.Memory = cmp.Or(cfg.Memory, def.Memory)

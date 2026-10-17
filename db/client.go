@@ -40,8 +40,7 @@ const DefaultPingTimeout = 5 * time.Second
 
 // ConnectionConfig holds connection pool, startup and timeout configuration.
 //
-// Zero values are ignored — the underlying sql.DB defaults are preserved for
-// any field left unset.
+// A zero field keeps the sql.DB default (PingTimeout uses DefaultPingTimeout).
 type ConnectionConfig struct {
 	// MaxOpenConns sets the maximum number of open connections to the database.
 	MaxOpenConns int
@@ -57,15 +56,13 @@ type ConnectionConfig struct {
 	// It does not apply to statements run through the DBTX handed to a
 	// WithTransaction callback; those are bounded by TxTimeout.
 	QueryTimeout time.Duration
-	// TxTimeout, when non-zero, bounds a whole WithTransaction call (begin, the
-	// callback and commit) unless its context already carries a shorter
-	// deadline. When it fires the transaction is rolled back and the callback's
-	// context is cancelled. Set it larger than QueryTimeout: it covers many
-	// statements, not one.
+	// TxTimeout, when non-zero, bounds a whole WithTransaction call (begin,
+	// callback and commit) unless the caller's context has a shorter deadline.
+	// When it fires the transaction is rolled back. Set it larger than
+	// QueryTimeout, since it covers many statements.
 	TxTimeout time.Duration
-	// PingTimeout bounds the connectivity check done by the constructor.
-	// Zero uses DefaultPingTimeout. The check also stops when the context given
-	// to the constructor is done.
+	// PingTimeout bounds the constructor's connectivity check. Zero uses
+	// DefaultPingTimeout.
 	PingTimeout time.Duration
 }
 

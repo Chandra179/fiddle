@@ -25,9 +25,8 @@ import (
 var sharedDSN string
 
 // TestMain starts one Postgres container for the whole suite, runs the tests,
-// then terminates the container. Using a single container rather than one per
-// test cuts cold-start overhead from O(n × 3s) to a flat ~3 s regardless of
-// how many tests are added.
+// then terminates the container. One shared container keeps startup cost flat
+// however many tests there are.
 func TestMain(m *testing.M) {
 	ctx := context.Background()
 

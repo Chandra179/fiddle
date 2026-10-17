@@ -53,8 +53,9 @@ type scryptHasher struct {
 
 // NewScryptHasher creates a PasswordHasher that stores scrypt hashes as
 // "$scrypt$ln=17,r=8,p=1$<salt>$<key>" (PHC string format; ln is log2(N)).
-// Zero-valued fields of cfg are filled from DefaultScryptConfig, and the same
-// validation as NewScrypter applies.
+// Zero-valued fields of cfg are filled from DefaultScryptConfig. It applies the
+// validation of NewScrypter and returns ErrInvalidParams if the cost exceeds the
+// limits Verify enforces.
 //
 // For new password storage prefer NewArgon2idHasher.
 func NewScryptHasher(cfg ScryptConfig) (PasswordHasher, error) {
