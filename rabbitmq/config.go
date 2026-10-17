@@ -63,33 +63,24 @@ type Config struct {
 
 	// Retry/DLX settings.
 	//
-	// RetryEnabled: a failed delivery is rejected without requeue so it flows
-	// through the queue's dead-letter exchange into the TTL retry queue (see
-	// TopologyManager.SetupDeadLetterExchange / SetupQueueWithDLX), which delays
-	// the retry by the TTL passed to SetupDeadLetterExchange. Without a DLX on
-	// the queue, rejected messages are dropped.
+	// RetryEnabled: reject a failed delivery without requeue, so the queue's
+	// dead-letter exchange routes it to the TTL retry queue (see
+	// TopologyManager.SetupDeadLetterExchange). Without a DLX it is dropped.
 	//
-	// When false, the client waits RetryBackoff (doubling with every retry),
-	// then republishes the failed delivery to the same queue with an
-	// incremented "x-retry-count" header and acks the original. It counts the
-	// attempts itself, so the loop is bounded by MaxRetries on classic and
-	// quorum queues alike (a plain requeue would only be bounded on quorum
-	// queues, by the broker's delivery limit). The copy goes to the back of the
-	// queue. The wait happens in the consume loop, so it also slows the
-	// consumer down while a dependency keeps failing, which is intended
-	// backpressure. The republish and the ack are two steps: if the ack is lost
-	// the message is delivered twice, as with any at-least-once consumer.
+	// Without RetryEnabled, the client waits RetryBackoff (doubling per retry),
+	// then republishes the message with an incremented "x-retry-count" header
+	// and acks the original. This bounds retries on any queue type. The wait
+	// blocks the consume loop, which slows the consumer while a dependency
+	// keeps failing. If the ack is lost the message is delivered twice.
 	//
-	// RetryBackoff is the base delay of that wait. Zero uses
-	// DefaultRetryBackoff; a negative value retries at once. It is ignored when
-	// RetryEnabled is true, where the retry queue's TTL is the delay.
+	// RetryBackoff: zero uses DefaultRetryBackoff, negative retries at once.
+	// Ignored when RetryEnabled is true.
 	//
-	// MaxRetries is the number of retries after the first failure. Zero uses
-	// DefaultMaxRetries; a negative value means no retries: a failed message
-	// goes straight to the parking lot (or is rejected).
+	// MaxRetries: retries after the first failure. Zero uses DefaultMaxRetries,
+	// negative means no retries.
 	//
-	// DeadLetterEnabled: once MaxRetries is reached the message is published
-	// to "<queue>.parking-lot" and acked. When false it is rejected instead.
+	// DeadLetterEnabled: after MaxRetries, publish the message to
+	// "<queue>.parking-lot" and ack it; otherwise reject it.
 	RetryEnabled      bool
 	RetryBackoff      time.Duration
 	MaxRetries        int

@@ -20,11 +20,8 @@ const (
 	// maxEncodedKeyLen bounds the derived key length read from an encoded hash.
 	maxEncodedKeyLen = 1024
 
-	// Verify takes its cost parameters from the stored hash, so it bounds them:
-	// a corrupted or hostile hash must not make it allocate gigabytes or burn
-	// minutes of CPU. NewScryptHasher applies the same limits, so a hasher never
-	// writes a hash it would refuse to verify. All sit well above the default
-	// (N=2^17, r=8, p=1: 128 MiB, N*r*p = 2^20).
+	// Verify reads cost parameters from the stored hash, so it bounds them.
+	// NewScryptHasher applies the same limits.
 	maxScryptMemory = 1 << 28 // 128*N*r bytes: 256 MiB
 	maxScryptR      = 32
 	maxScryptP      = 16

@@ -472,17 +472,10 @@ func (c *Client) republish(ctx context.Context, queue string, d amqp.Delivery) e
 	return waitConfirm(ctx, dc)
 }
 
-// getRetryCount returns how many times d has already failed on queue.
-//
-// It takes the largest of three counters, each maintained by a different
-// retry path, so it never under-counts when a message has been through more
-// than one of them (for example after RetryEnabled was toggled between
-// deploys). Every delivery attempt counts, including a quorum redelivery after
-// a consumer crash, so a message can reach MaxRetries slightly early but never
-// late: the "count" of the x-death entry for queue (incremented each
-// time the message is dead-lettered from it, RetryEnabled), the x-retry-count
-// header (set by the client when it republishes, RetryEnabled=false) and the
-// x-delivery-count header that quorum queues set on redelivery.
+// getRetryCount returns how many times d has failed on queue: the largest of
+// the x-death count for queue, x-retry-count and x-delivery-count. Taking the
+// largest never under-counts a message that went through more than one retry
+// path.
 func getRetryCount(d amqp.Delivery, queue string) int {
 	count := xDeathCount(d.Headers, queue)
 	for _, header := range []string{retryCountHeader, "x-delivery-count"} {

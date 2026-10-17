@@ -10,11 +10,8 @@ import (
 	"golang.org/x/crypto/argon2"
 )
 
-// Verify takes its cost parameters from the stored hash, so it bounds them: a
-// corrupted or hostile hash must not make it allocate gigabytes or burn minutes
-// of CPU. NewArgon2idHasher applies the same limits, so a hasher never writes a
-// hash it would refuse to verify. All sit well above the default (m=64 MiB,
-// t=3, p=4: 192 MiB of memory passes).
+// Verify reads cost parameters from the stored hash, so it bounds them.
+// NewArgon2idHasher applies the same limits.
 const (
 	maxArgon2Memory  = 1 << 19 // KiB: 512 MiB
 	maxArgon2Time    = 10

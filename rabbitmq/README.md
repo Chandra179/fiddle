@@ -60,13 +60,12 @@ Go SDK for RabbitMQ with auto-reconnection, channel pooling, OTel tracing, and d
 main queue ──x-dead-letter-exchange──→ DLX (topic exchange)
        │                                   │
   Reject(false)                    routing key: orders
-  after max retries                      │
-       │                          orders.retry queue
-       │                          (TTL: 30s, DLX → main)
-       │                                   │
-       │                          TTL expires → main queue
-       │                                   │
-       └─→ DLX ──routing key: orders.parking-lot──→ parking-lot queue
+  (RetryEnabled)                         │
+                                  orders.retry queue
+                                  (TTL: 30s, dead-letters back to main)
+
+after MaxRetries the consumer publishes a copy straight to the
+orders.parking-lot queue and acks the original (no DLX involved)
 ```
 
 ### channelPool
@@ -142,10 +141,10 @@ graph LR
     end
 
     MainQ -- "x-dead-letter-exchange" --> DLX
-    MainQ -- "Reject(false)<br/>after max retries" --> DLX
+    MainQ -- "Reject(false)<br/>(RetryEnabled)" --> DLX
     RetryQ -- "TTL expires" --> MainQ
     DLX -- "routing key: orders" --> RetryQ
-    DLX -- "routing key: orders.parking-lot" --> ParkingQ
+    MainQ -. "after MaxRetries:<br/>copy published, original acked" .-> ParkingQ
 
     style MainQ fill:#e8f5e9,stroke:#2e7d32
     style DLX fill:#fff3e0,stroke:#ef6c00
