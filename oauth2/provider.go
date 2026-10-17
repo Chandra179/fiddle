@@ -11,11 +11,9 @@ type Manager interface {
 	// RegisterProvider registers a new authentication provider.
 	RegisterProvider(provider Provider)
 
-	// GetAuthURL generates an authorization URL with state, nonce, and PKCE for the named provider.
-	GetAuthURL(providerName string) (string, error)
-
-	// GetAuthURLWithState is GetAuthURL that also returns the generated state,
-	// so callers can bind it to the browser (e.g. a cookie) for login CSRF protection.
+	// GetAuthURLWithState generates an authorization URL with state, nonce, and PKCE
+	// for the named provider. It also returns the generated state, so callers can
+	// bind it to the browser (e.g. a cookie) for login CSRF protection.
 	GetAuthURLWithState(providerName string) (authURL string, state string, err error)
 
 	// HandleCallback handles the OAuth2/OIDC callback and invokes the configured callback handler.

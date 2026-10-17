@@ -1,8 +1,11 @@
+//go:build integration
+
 package example
 
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -11,7 +14,6 @@ import (
 
 	"db"
 
-	_ "github.com/lib/pq"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
@@ -62,7 +64,7 @@ func TestMain(m *testing.M) {
 // client.Close via t.Cleanup — callers do not need to close it manually.
 func newClient(t *testing.T, cfg db.ConnectionConfig) db.DB {
 	t.Helper()
-	client, err := db.NewPostgresClient(sharedDSN, cfg)
+	client, err := db.NewPostgresClient(context.Background(), sharedDSN, cfg)
 	require.NoError(t, err, "NewPostgresClient")
 	t.Cleanup(func() { _ = client.Close() })
 	return client
@@ -77,9 +79,11 @@ func newSchema(t *testing.T, cfg db.ConnectionConfig) db.DB {
 	ctx := context.Background()
 
 	// Admin client — only used to create/drop the schema itself.
-	admin, err := db.NewPostgresClient(sharedDSN, db.ConnectionConfig{})
+	admin, err := db.NewPostgresClient(ctx, sharedDSN, db.ConnectionConfig{})
 	require.NoError(t, err)
-	defer admin.Close()
+	// Registered before the DROP below: cleanups run last-in first-out, so the
+	// schema is dropped while admin is still open.
+	t.Cleanup(func() { _ = admin.Close() })
 
 	schema := safeSchemaName(t)
 
@@ -92,7 +96,7 @@ func newSchema(t *testing.T, cfg db.ConnectionConfig) db.DB {
 
 	// Scoped client — all queries land in this test's private schema.
 	scopedDSN := fmt.Sprintf("%s&search_path=%s", sharedDSN, schema)
-	client, err := db.NewPostgresClient(scopedDSN, cfg)
+	client, err := db.NewPostgresClient(ctx, scopedDSN, cfg)
 	require.NoError(t, err, "NewPostgresClient (scoped)")
 	t.Cleanup(func() { _ = client.Close() })
 
@@ -154,11 +158,32 @@ func TestConnect(t *testing.T) {
 
 func TestConnect_BadDSN(t *testing.T) {
 	_, err := db.NewPostgresClient(
+		context.Background(),
 		"postgres://bad:bad@localhost:1/nodb?sslmode=disable",
 		db.ConnectionConfig{},
 	)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, db.ErrConnectionFailed)
+}
+
+func TestConnect_ContextCancelsStartupPing(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := db.NewPostgresClient(ctx, sharedDSN, db.ConnectionConfig{})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, db.ErrConnectionFailed)
+	assert.ErrorIs(t, err, context.Canceled)
+}
+
+func TestConnect_PingTimeoutIsConfigurable(t *testing.T) {
+	// The default is 5s; a 1ns budget must fail the ping immediately.
+	_, err := db.NewPostgresClient(context.Background(), sharedDSN, db.ConnectionConfig{
+		PingTimeout: time.Nanosecond,
+	})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, db.ErrConnectionFailed)
+	assert.True(t, db.IsTimeoutError(err), "got %v", err)
 }
 
 func TestExecAndQuery(t *testing.T) {
@@ -176,7 +201,7 @@ func TestExecAndQuery(t *testing.T) {
 
 	rows, err := client.QueryContext(ctx, `SELECT email FROM users`)
 	require.NoError(t, err)
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var count int
 	for rows.Next() {
@@ -192,7 +217,7 @@ func TestPrepareContext(t *testing.T) {
 
 	stmt, err := client.PrepareContext(ctx, `SELECT email FROM users WHERE email = $1`)
 	require.NoError(t, err)
-	defer stmt.Close()
+	defer func() { _ = stmt.Close() }()
 
 	var email string
 	err = stmt.QueryRowContext(ctx, "nobody@example.com").Scan(&email)
@@ -220,7 +245,7 @@ func TestWithTransaction_Rollback(t *testing.T) {
 	client := newSchema(t, db.ConnectionConfig{})
 	ctx := context.Background()
 
-	sentinel := fmt.Errorf("intentional failure")
+	sentinel := errors.New("intentional failure")
 
 	err := client.WithTransaction(ctx, sql.LevelReadCommitted, func(ctx context.Context, tx db.DBTX) error {
 		if _, err := tx.ExecContext(ctx,
@@ -369,7 +394,7 @@ func TestQueryTimeout_NoTimeout(t *testing.T) {
 
 func TestClose(t *testing.T) {
 	// Deliberately not using newClient — we manage Close ourselves here.
-	client, err := db.NewPostgresClient(sharedDSN, db.ConnectionConfig{})
+	client, err := db.NewPostgresClient(context.Background(), sharedDSN, db.ConnectionConfig{})
 	require.NoError(t, err)
 
 	require.NoError(t, client.Close())
@@ -387,7 +412,7 @@ func TestQueryTimeout_QueryRowsIterable(t *testing.T) {
 
 	rows, err := client.QueryContext(ctx, `SELECT generate_series(1, 100)`)
 	require.NoError(t, err)
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var n int
 	for rows.Next() {
@@ -406,6 +431,66 @@ func TestQueryTimeout_QueryRowScan(t *testing.T) {
 	err := client.QueryRowContext(context.Background(), `SELECT 42`).Scan(&v)
 	require.NoError(t, err)
 	assert.Equal(t, 42, v)
+}
+
+func TestTxTimeout_BoundsWholeTransaction(t *testing.T) {
+	// Each statement is well inside QueryTimeout (which does not apply inside a
+	// transaction anyway); only the total exceeds TxTimeout.
+	client := newSchema(t, db.ConnectionConfig{
+		QueryTimeout: 30 * time.Second,
+		TxTimeout:    300 * time.Millisecond,
+	})
+	ctx := context.Background()
+
+	err := client.WithTransaction(ctx, sql.LevelReadCommitted, func(ctx context.Context, tx db.DBTX) error {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO users (email) VALUES ('tx-timeout@example.com')`); err != nil {
+			return err
+		}
+		for range 10 {
+			if _, err := tx.ExecContext(ctx, `SELECT pg_sleep(0.1)`); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	require.Error(t, err)
+	assert.True(t, db.IsTimeoutError(err), "TxTimeout expiry must classify as a timeout, got %v", err)
+	assert.ErrorIs(t, err, context.DeadlineExceeded, "the original error must stay wrapped, got %v", err)
+
+	var n int
+	require.NoError(t, client.QueryRowContext(ctx, `SELECT count(*) FROM users`).Scan(&n))
+	assert.Zero(t, n, "the timed-out transaction must have rolled back")
+}
+
+func TestTxTimeout_NotHitByFastTransaction(t *testing.T) {
+	client := newSchema(t, db.ConnectionConfig{TxTimeout: 5 * time.Second})
+	ctx := context.Background()
+
+	err := client.WithTransaction(ctx, sql.LevelReadCommitted, func(ctx context.Context, tx db.DBTX) error {
+		_, err := tx.ExecContext(ctx, `INSERT INTO users (email) VALUES ('fast@example.com')`)
+		return err
+	})
+	require.NoError(t, err)
+
+	var n int
+	require.NoError(t, client.QueryRowContext(ctx, `SELECT count(*) FROM users`).Scan(&n))
+	assert.Equal(t, 1, n)
+}
+
+func TestTxTimeout_CallerDeadlineTighter(t *testing.T) {
+	client := newSchema(t, db.ConnectionConfig{TxTimeout: 30 * time.Second})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err := client.WithTransaction(ctx, sql.LevelReadCommitted, func(ctx context.Context, tx db.DBTX) error {
+		_, err := tx.ExecContext(ctx, `SELECT pg_sleep(5)`)
+		return err
+	})
+	require.Error(t, err)
+	assert.True(t, db.IsTimeoutError(err), "got %v", err)
+	assert.Less(t, time.Since(start), 5*time.Second, "caller deadline must win over TxTimeout")
 }
 
 func TestIsSerializationError_SerializableConflict(t *testing.T) {
@@ -453,4 +538,92 @@ func TestIsSerializationError_SerializableConflict(t *testing.T) {
 	require.Error(t, failed)
 	assert.True(t, db.IsSerializationError(failed), "got %v", failed)
 	assert.False(t, db.IsTimeoutError(failed), "serialization failure is not a timeout")
+}
+
+// pgx prepares and caches statements by default, which PgBouncer in
+// transaction-pooling mode cannot serve (a statement is prepared on one server
+// connection and executed on another). default_query_exec_mode in the DSN picks
+// a mode that does not create named prepared statements.
+func TestQueryExecMode_ControlsPreparedStatements(t *testing.T) {
+	cases := []struct {
+		mode         string
+		wantPrepared bool
+	}{
+		{"", true}, // pgx default: statements are prepared and cached
+		{"cache_describe", false},
+		{"exec", false},
+		{"simple_protocol", false},
+	}
+	for _, tc := range cases {
+		t.Run("mode="+tc.mode, func(t *testing.T) {
+			dsn := sharedDSN
+			if tc.mode != "" {
+				dsn += "&default_query_exec_mode=" + tc.mode
+			}
+			ctx := context.Background()
+			// One connection, so every statement runs in the same session.
+			client, err := db.NewPostgresClient(ctx, dsn, db.ConnectionConfig{MaxOpenConns: 1})
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = client.Close() })
+
+			for i := range 3 {
+				var n int
+				require.NoError(t, client.QueryRowContext(ctx, `SELECT $1::int`, i).Scan(&n))
+				assert.Equal(t, i, n)
+			}
+
+			var prepared int
+			require.NoError(t, client.QueryRowContext(ctx, `SELECT count(*) FROM pg_prepared_statements`).Scan(&prepared))
+			if tc.wantPrepared {
+				assert.Positive(t, prepared, "the default mode keeps prepared statements")
+			} else {
+				assert.Zero(t, prepared, "this mode must not create named prepared statements")
+			}
+		})
+	}
+}
+
+// Common column types scan into plain Go types through database/sql. This pins
+// the behaviour of the pgx driver so a driver change shows up here.
+func TestScan_CommonColumnTypes(t *testing.T) {
+	client := newClient(t, db.ConnectionConfig{})
+	ctx := context.Background()
+
+	var (
+		jsonCol, bytesCol, numRaw []byte
+		jsonb, uuid, numStr       string
+		numFloat                  float64
+		ts                        time.Time
+		flag                      bool
+		big                       int64
+		missing                   sql.NullString
+		date                      time.Time
+	)
+	err := client.QueryRowContext(ctx, `SELECT
+		'{"a":1}'::json,
+		'{"a": 1}'::jsonb,
+		'123e4567-e89b-12d3-a456-426614174000'::uuid,
+		12.50::numeric,
+		12.50::numeric,
+		12.50::numeric,
+		'2026-10-17 10:00:00+00'::timestamptz,
+		'\xdeadbeef'::bytea,
+		true,
+		9007199254740993::bigint,
+		NULL::text,
+		'2026-10-17'::date`).Scan(&jsonCol, &jsonb, &uuid, &numStr, &numFloat, &numRaw, &ts, &bytesCol, &flag, &big, &missing, &date)
+	require.NoError(t, err)
+
+	assert.JSONEq(t, `{"a":1}`, string(jsonCol), "json scans into []byte")
+	assert.JSONEq(t, `{"a":1}`, jsonb, "jsonb scans into string")
+	assert.Equal(t, "123e4567-e89b-12d3-a456-426614174000", uuid, "uuid scans into string")
+	assert.Equal(t, "12.50", numStr, "numeric keeps its scale as a string")
+	assert.InDelta(t, 12.5, numFloat, 0)
+	assert.Equal(t, "12.50", string(numRaw))
+	assert.True(t, ts.Equal(time.Date(2026, 10, 17, 10, 0, 0, 0, time.UTC)), "timestamptz scans into time.Time")
+	assert.Equal(t, []byte{0xde, 0xad, 0xbe, 0xef}, bytesCol)
+	assert.True(t, flag)
+	assert.Equal(t, int64(9007199254740993), big, "bigint keeps full precision")
+	assert.False(t, missing.Valid, "NULL scans into sql.Null*")
+	assert.Equal(t, 2026, date.Year())
 }

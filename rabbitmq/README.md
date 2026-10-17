@@ -120,6 +120,8 @@ sequenceDiagram
     end
 ```
 
+On every reconnect the cached topology is re-declared **before** the client reports healthy, so consumers waiting on `IsHealthy` find their queues. A declaration the broker rejects (for example `PRECONDITION_FAILED` because the queue exists with different arguments) is logged and skipped, and the other entries are still restored; it is tried again on the next reconnect. A lost connection fails the attempt, which is retried with backoff.
+
 ## Dead-Letter Exchange Topology
 
 ```mermaid
@@ -165,19 +167,23 @@ sequenceDiagram
     P->>B: PublishMessage("orders", payload)
     B->>Q: route
     Q->>C: deliver
-    C->>C: handler(payload)
+    C->>C: handler(ctx, delivery)
     alt success
         C->>Q: Ack
-    else handler error, retries < MaxRetries
-        C->>Q: Nack(true) — requeue
-        Note over Q: x-death count incremented
-    else handler error, retries >= MaxRetries
+    else handler error, retries < MaxRetries, RetryEnabled
         C->>Q: Reject(false)
         Q->>DLX: route via x-dead-letter-exchange
-        DLX->>D: route to parking-lot
-    else JSON unmarshal fails
-        C->>Q: Reject(false)
-        Q->>DLX: route
+        Note over DLX: retry queue, back to Q after the retry queue TTL<br/>x-death count incremented
+    else handler error, retries < MaxRetries, not RetryEnabled
+        C->>Q: republish copy, x-retry-count + 1
+        C->>Q: Ack original
+    else handler error, retries >= MaxRetries (or ErrPoisonMessage)
+        alt DeadLetterEnabled
+            C->>D: publish copy to orders.parking-lot
+            C->>Q: Ack original
+        else
+            C->>Q: Reject(false)
+        end
     end
 ```
 
@@ -192,7 +198,10 @@ sequenceDiagram
     BC->>Q: Consume (QoS prefetch, autoAck=false)
     loop accumulating
         Q-->>BC: delivery
-        BC->>BC: JSON unmarshal
+        opt WithBatchValidator set
+            BC->>BC: validate(delivery)
+            Note over BC: invalid: settled on its own<br/>(parking lot / reject), not batched
+        end
         BC->>BC: append to batch[]
         alt batchSize reached
             BC->>BC: flush()
@@ -200,13 +209,13 @@ sequenceDiagram
             BC->>BC: flush()
         end
     end
-    BC->>H: handler(ctx, batch, deliveries)
+    BC->>H: handler(ctx, deliveries)
     alt success
         H-->>BC: nil
-        BC->>Q: batch Ack (each msg)
+        BC->>Q: multiple Ack on the last delivery
     else failure
         H-->>BC: error
-        BC->>Q: batch Nack(true) (each msg)
+        BC->>Q: retry policy applied per delivery
     end
     Q-->>BC: ctx cancelled
     BC->>BC: flush() remaining
@@ -228,8 +237,18 @@ sequenceDiagram
 | Type | Constructor | Notes |
 |------|-------------|-------|
 | `*Client` | `NewClient(config *Config, logger *slog.Logger) (*Client, error)` | Two AMQP conns (pub + con), channel pool, topology cache |
-| `*BatchConsumer` | `NewBatchConsumer(client *Client, logger *slog.Logger, batchSize int, flushTimeout time.Duration) *BatchConsumer` | Owns its own channel; not part of `Subscriber` interface |
-| `*Config` | `NewDefaultConfig() *Config` | Pre-populated defaults; caller must set `URL` + `ConnectionName` |
+| `*BatchConsumer` | `NewBatchConsumer(client *Client, logger *slog.Logger, batchSize int, flushTimeout time.Duration, opts ...BatchOption) *BatchConsumer` | Owns its own channel; not part of `Subscriber` interface |
+| `*Config` | `NewDefaultConfig() *Config` | Pre-populated defaults; caller must set `URL`. `NewClient` fills the other unset fields (`ApplyDefaults`) and checks the result (`Validate`) on a copy |
+
+### Handlers
+
+| Type | Signature | Notes |
+|------|-----------|-------|
+| `MessageHandler` | `func(ctx, delivery amqp.Delivery) error` | Raw payload in `delivery.Body`; any content type |
+| `JSONHandler[T]` | `JSONHandler(func(ctx, msg T, delivery) error) MessageHandler` | Decodes the body into `T`; an undecodable body is a poison message |
+| `BatchHandler` | `func(ctx, deliveries []amqp.Delivery) error` | Raw payloads |
+| `JSONBatchHandler[T]` | `JSONBatchHandler(func(ctx, msgs []T, deliveries) error) BatchHandler` | `msgs[i]` belongs to `deliveries[i]` |
+| `ValidJSON` | `func(amqp.Delivery) error` | For `WithBatchValidator`: keeps non-JSON bodies out of batches |
 
 ### Errors
 
@@ -237,6 +256,7 @@ sequenceDiagram
 |----------|---------|
 | `ErrNotConnected` | `rabbitmq: client not connected` |
 | `ErrURLRequired` | `rabbitmq: URL is required` |
+| `ErrPoisonMessage` | Wrap it in a handler error to skip the retries: the message is parked (`DeadLetterEnabled`) or rejected at once. `JSONHandler` does so for undecodable bodies |
 
 ### Health & State
 
@@ -260,7 +280,6 @@ client, err := rabbitmq.NewClient(&rabbitmq.Config{
     PublisherConfirms: true,
     QueueType:         rabbitmq.QueueTypeQuorum,
     RetryEnabled:      true,
-    RetryTTL:          30 * time.Second,
     MaxRetries:        3,
     DeadLetterEnabled: true,
 }, logger)
@@ -331,11 +350,18 @@ producer.PublishBatch(ctx, rabbitmq.PublishOptions{
 ```go
 consumer := rabbitmq.NewConsumer(client, logger)
 
-handler := func(ctx context.Context, msg interface{}, delivery amqp.Delivery) error {
-    // Process message
+// Typed JSON: the body is decoded into Order. A body that does not decode is a
+// poison message and is parked without retries.
+handler := rabbitmq.JSONHandler(func(ctx context.Context, order Order, delivery amqp.Delivery) error {
+    // Process order
     // Return nil → Ack
-    // Return error → Nack (requeue) or Reject (DLX) based on x-death count
+    // Return error → retry policy (see below)
     return nil
+})
+
+// Raw bytes: any content type, nothing is decoded for you.
+raw := func(ctx context.Context, delivery amqp.Delivery) error {
+    return process(delivery.ContentType, delivery.Body)
 }
 
 // Minimal (sensible defaults: manual ack, no auto-reconnect)
@@ -349,17 +375,29 @@ consumer.StartConsumer(ctx, rabbitmq.ConsumeOptions{
 }, handler)
 ```
 
+A handler error is settled by the retry policy:
+
+| Situation | What happens |
+|-----------|--------------|
+| `RetryEnabled`, attempts < `MaxRetries` | `Reject(false)`; the queue's DLX routes the message through the TTL retry queue (its TTL is the one given to `SetupDeadLetterExchange`) |
+| not `RetryEnabled`, attempts < `MaxRetries` | The consumer waits `RetryBackoff` (doubling with each retry, capped at 30s), then republishes a copy with `x-retry-count` + 1 and acks the original. Works on classic and quorum queues. The wait is in the consume loop, so it also slows the consumer while a dependency keeps failing; a batch waits once for all its messages. The republished copy keeps the message properties, `Expiration` included (it gets its full TTL again), but not `UserId`, which the broker rejects when it differs from the connection's user |
+| attempts >= `MaxRetries`, or error wraps `ErrPoisonMessage` | `DeadLetterEnabled`: copy published to `<queue>.parking-lot`, original acked. Otherwise `Reject(false)` |
+
+The attempt count is the largest of the `x-death` count, `x-retry-count` and the quorum queue's `x-delivery-count`.
+
 ### Batch consume
 
 ```go
-bc := rabbitmq.NewBatchConsumer(client, logger, 100, 5*time.Second)
+bc := rabbitmq.NewBatchConsumer(client, logger, 100, 5*time.Second,
+    rabbitmq.WithBatchValidator(rabbitmq.ValidJSON), // optional: park non-JSON bodies on their own
+)
 
-batchHandler := func(ctx context.Context, messages []interface{}, deliveries []amqp.Delivery) error {
+batchHandler := rabbitmq.JSONBatchHandler(func(ctx context.Context, orders []Order, deliveries []amqp.Delivery) error {
     // Process batch
-    // Return nil → batch Ack
-    // Return error → batch Nack (requeue all)
+    // Return nil → one multiple-Ack for the whole batch
+    // Return error → retry policy applied to every delivery
     return nil
-}
+})
 
 bc.StartBatchConsumer(ctx, rabbitmq.ConsumeOptions{
     QueueName: "orders",
@@ -376,7 +414,7 @@ bc.StartBatchConsumer(ctx, rabbitmq.ConsumeOptions{
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `URL` | `string` | **required** | AMQP connection string |
-| `ConnectionName` | `string` | **required** | Identifies client in broker UI |
+| `ConnectionName` | `string` | `"go-service"` | Identifies client in broker UI |
 | `PublisherConfirms` | `bool` | `false` | Enable per-message publisher confirms |
 | `ChannelPoolSize` | `int` | `10` | Number of pre-allocated publisher channels |
 | `Mandatory` | `bool` | `false` | Broker returns unroutable messages via `OnReturn` |
@@ -384,13 +422,9 @@ bc.StartBatchConsumer(ctx, rabbitmq.ConsumeOptions{
 | `PrefetchCount` | `int` | `10` | Consumer QoS prefetch count |
 | `AutoAck` | `bool` | `false` | Should always be `false` in production |
 | `QueueType` | `QueueType` | `"quorum"` | `QueueTypeQuorum` or `QueueTypeClassic` |
-| `Durable` | `bool` | `true` | Queue durability default |
-| `AutoDelete` | `bool` | `false` | Queue auto-delete default |
-| `Exclusive` | `bool` | `false` | Queue exclusivity default |
-| `NoWait` | `bool` | `false` | Queue no-wait default |
-| `RetryEnabled` | `bool` | `false` | Enable retry logic in consumer |
-| `RetryTTL` | `time.Duration` | `30s` | Retry queue message TTL |
-| `MaxRetries` | `int` | `3` | Max retry count (from `x-death` header) |
+| `RetryEnabled` | `bool` | `false` | Retry through the queue's DLX and TTL retry queue. When `false`, retries are republished with an `x-retry-count` header; see [Consume](#consume) |
+| `RetryBackoff` | `time.Duration` | `1s` | Base delay between counted retries when `RetryEnabled` is `false`; doubles per retry, capped at 30s. Zero uses the default, negative retries at once |
+| `MaxRetries` | `int` | `3` | Retries after the first failure (the count is the largest of `x-death`, `x-retry-count`, `x-delivery-count`). Zero means "unset" and uses the default, so write a negative value for no retries: failures then go straight to the parking lot (or are rejected) |
 | `DeadLetterEnabled` | `bool` | `false` | Enable DLX routing for failed messages |
 | `ReconnectInitialInterval` | `time.Duration` | `1s` | Exponential backoff start |
 | `ReconnectMaxInterval` | `time.Duration` | `60s` | Exponential backoff cap |
@@ -472,8 +506,9 @@ bc.StartBatchConsumer(ctx, rabbitmq.ConsumeOptions{
 ## Testing
 
 ```bash
-cd rabbitmq && make test
+cd rabbitmq && go test ./...    # unit tests, no Docker
+cd rabbitmq && make test        # + integration tests
 # Expands to: go test -tags integration -v -count=1 -timeout 300s ./...
 ```
 
-Requires Docker (testcontainers with `rabbitmq:4.2-management-alpine`).
+The integration tests (build tag `integration`) require Docker (testcontainers with `rabbitmq:4.2-management-alpine`). Outage tests do not restart the container: they route the client through an in-process TCP proxy and cut it, so the broker's mapped port never changes.

@@ -3,8 +3,10 @@ package rabbitmq
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -13,8 +15,38 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
+// ErrPoisonMessage marks a message that can never be processed, such as a
+// malformed payload. When a MessageHandler returns an error wrapping it the
+// consumer skips the retries and settles the message as if MaxRetries was
+// already reached: it is moved to "<queue>.parking-lot" when DeadLetterEnabled,
+// and rejected otherwise.
+var ErrPoisonMessage = errors.New("rabbitmq: poison message")
+
 // MessageHandler is called for each consumed message.
-type MessageHandler func(ctx context.Context, msg any, delivery amqp.Delivery) error
+//
+// The payload is delivery.Body, exactly as published: the consumer neither
+// decodes it nor assumes a content type. Use JSONHandler for typed JSON.
+//
+// Returning nil acks the message. Returning an error applies the retry policy
+// of Config (RetryEnabled, MaxRetries, DeadLetterEnabled); an error wrapping
+// ErrPoisonMessage skips the retries.
+type MessageHandler func(ctx context.Context, delivery amqp.Delivery) error
+
+// JSONHandler adapts a typed handler to a MessageHandler. The body is decoded
+// into T with json.Unmarshal; a body that does not decode makes the message a
+// poison message (ErrPoisonMessage), since redelivering it cannot help.
+//
+// Decode into a struct, or use json.Number fields, for numbers that must keep
+// their precision: with T = any, JSON numbers become float64.
+func JSONHandler[T any](fn func(ctx context.Context, msg T, delivery amqp.Delivery) error) MessageHandler {
+	return func(ctx context.Context, d amqp.Delivery) error {
+		var msg T
+		if err := json.Unmarshal(d.Body, &msg); err != nil {
+			return fmt.Errorf("%w: decode JSON body: %w", ErrPoisonMessage, err)
+		}
+		return fn(ctx, msg, d)
+	}
+}
 
 // Consumer handles message consumption with QoS and OTel tracing.
 type Consumer struct {
@@ -44,6 +76,9 @@ type ConsumeOptions struct {
 	AutoReconnect bool // When true, the consumer restarts after delivery channel closure.
 }
 
+// errDeliveryChannelClosed ends a consume loop whose delivery channel closed.
+var errDeliveryChannelClosed = errors.New("delivery channel closed")
+
 // StartConsumer starts consuming messages from a queue.
 // If opts.AutoReconnect is true, it will automatically restart on delivery channel closure.
 func (c *Consumer) StartConsumer(ctx context.Context, opts ConsumeOptions, handler MessageHandler) error {
@@ -60,21 +95,14 @@ func (c *Consumer) startConsumeLoop(ctx context.Context, opts ConsumeOptions, ha
 		return fmt.Errorf("failed to create consumer channel: %w", err)
 	}
 
+	// PrefetchCount was validated by NewClient and is positive.
 	prefetchCount := c.client.config.PrefetchCount
-	if prefetchCount <= 0 {
-		ch.Close()
-		return fmt.Errorf("prefetchCount must be > 0")
-	}
-
 	if err := ch.Qos(prefetchCount, 0, false); err != nil {
-		ch.Close()
+		_ = ch.Close()
 		return fmt.Errorf("failed to set QoS: %w", err)
 	}
 
-	autoAck := c.client.config.AutoAck
-	if opts.AutoAck {
-		autoAck = true
-	}
+	autoAck := c.client.config.AutoAck || opts.AutoAck
 
 	deliveries, err := ch.Consume(
 		opts.QueueName,
@@ -86,7 +114,7 @@ func (c *Consumer) startConsumeLoop(ctx context.Context, opts ConsumeOptions, ha
 		opts.Args,
 	)
 	if err != nil {
-		ch.Close()
+		_ = ch.Close()
 		return fmt.Errorf("failed to start consuming: %w", err)
 	}
 
@@ -102,25 +130,25 @@ func (c *Consumer) startConsumeLoop(ctx context.Context, opts ConsumeOptions, ha
 	for {
 		select {
 		case <-ctx.Done():
-			ch.Close()
+			_ = ch.Close()
 			return ctx.Err()
 
 		case reason, ok := <-cancelChan:
-			ch.Close()
-			if ok {
-				c.logger.Warn("consumer cancelled by broker",
-					"queue", opts.QueueName,
-					"reason", reason,
-				)
-				return fmt.Errorf("consumer cancelled by broker: %s", reason)
+			_ = ch.Close()
+			if !ok {
+				return errors.New("consumer cancelled by broker")
 			}
-			return fmt.Errorf("consumer cancelled by broker")
+			c.logger.Warn("consumer cancelled by broker",
+				"queue", opts.QueueName,
+				"reason", reason,
+			)
+			return fmt.Errorf("consumer cancelled by broker: %s", reason)
 
 		case delivery, ok := <-deliveries:
 			if !ok {
 				c.logger.Warn("delivery channel closed")
-				ch.Close()
-				return fmt.Errorf("delivery channel closed")
+				_ = ch.Close()
+				return errDeliveryChannelClosed
 			}
 
 			if err := c.processDelivery(ctx, delivery, handler, autoAck, opts.QueueName); err != nil {
@@ -176,94 +204,194 @@ func (c *Consumer) waitForReconnect(ctx context.Context) bool {
 	}
 }
 
+// traceCarrier returns the string headers of a delivery, which is where trace
+// context propagates.
+func traceCarrier(headers amqp.Table) propagation.MapCarrier {
+	carrier := make(propagation.MapCarrier, len(headers))
+	for k, v := range headers {
+		if str, ok := v.(string); ok {
+			carrier[k] = str
+		}
+	}
+	return carrier
+}
+
 // processDelivery processes a single delivery with tracing and ack management.
 func (c *Consumer) processDelivery(ctx context.Context, delivery amqp.Delivery, handler MessageHandler, autoAck bool, queue string) error {
-	// Extract trace context from headers
-	carrier := propagation.MapCarrier{}
-	for k, v := range delivery.Headers {
-		if strVal, ok := v.(string); ok {
-			carrier[k] = strVal
-		}
-	}
+	ctx = otel.GetTextMapPropagator().Extract(ctx, traceCarrier(delivery.Headers))
 
-	ctx = otel.GetTextMapPropagator().Extract(ctx, carrier)
-
-	ctx, span := c.tracer.Start(ctx, "rabbitmq.consume",
-		trace.WithAttributes(),
-	)
+	ctx, span := c.tracer.Start(ctx, "rabbitmq.consume")
 	defer span.End()
 
-	var msg any
-	if err := json.Unmarshal(delivery.Body, &msg); err != nil {
+	if err := handler(ctx, delivery); err != nil {
 		span.RecordError(err)
 
 		if !autoAck {
-			if rejectErr := delivery.Reject(false); rejectErr != nil {
-				c.logger.Error("failed to reject message", "error", rejectErr)
-			}
-		}
-		return fmt.Errorf("failed to unmarshal message: %w", err)
-	}
-
-	if err := handler(ctx, msg, delivery); err != nil {
-		span.RecordError(err)
-
-		if !autoAck {
-			handleFailedDelivery(ctx, c.client, c.logger, delivery, queue)
+			c.settleFailure(ctx, delivery, queue, err)
 		}
 		return fmt.Errorf("handler error: %w", err)
 	}
 
-	if !autoAck {
-		if err := delivery.Ack(false); err != nil {
-			c.logger.Error("failed to acknowledge message", "error", err)
-			return fmt.Errorf("failed to ack: %w", err)
-		}
+	if autoAck {
+		return nil
 	}
-
+	if err := delivery.Ack(false); err != nil {
+		c.logger.Error("failed to acknowledge message", "error", err)
+		return fmt.Errorf("failed to ack: %w", err)
+	}
 	return nil
+}
+
+// settleFailure settles a delivery whose handler returned err.
+func (c *Consumer) settleFailure(ctx context.Context, d amqp.Delivery, queue string, err error) {
+	cfg := c.client.config
+	if errors.Is(err, ErrPoisonMessage) {
+		settleExhausted(ctx, cfg, c.logger, c.client.republish, d, queue, "poison message")
+		return
+	}
+	if !c.waitBeforeRetry(ctx, queue, d) {
+		return
+	}
+	handleFailedDelivery(ctx, cfg, c.logger, c.client.republish, d, queue)
+}
+
+// waitBeforeRetry waits out the retry backoff for d and reports whether to go
+// on settling it. When ctx ends first the delivery is left unacked: closing the
+// consumer's channel makes the broker redeliver it.
+func (c *Consumer) waitBeforeRetry(ctx context.Context, queue string, ds ...amqp.Delivery) bool {
+	if err := waitBeforeRetry(ctx, c.client.config, queue, ds...); err != nil {
+		c.logger.Warn("retry wait interrupted, leaving message unacked", "queue", queue, "error", err)
+		return false
+	}
+	return true
 }
 
 // parkingLotSuffix names the queue that receives messages which exhausted
 // their retries (see TopologyManager.SetupDeadLetterExchange).
 const parkingLotSuffix = ".parking-lot"
 
+// retryCountHeader carries the number of failed attempts when RetryEnabled is
+// false and the client republishes the message itself.
+const retryCountHeader = "x-retry-count"
+
+// republishFunc publishes a copy of d to queue through the default exchange.
+type republishFunc func(ctx context.Context, queue string, d amqp.Delivery) error
+
+// maxRetryDelay caps the backoff between counted retries.
+const maxRetryDelay = 30 * time.Second
+
+// retryDelay is the wait before the retry that follows retryCount failures:
+// base, doubling with every failure, capped at maxRetryDelay. A non-positive
+// base means no delay.
+func retryDelay(base time.Duration, retryCount int) time.Duration {
+	if base <= 0 {
+		return 0
+	}
+	d := base
+	for range retryCount {
+		if d >= maxRetryDelay {
+			break
+		}
+		d *= 2
+	}
+	return min(d, maxRetryDelay)
+}
+
+// waitBeforeRetry sleeps for the backoff that the counted-retry path owes the
+// deliveries ds, which is the longest one any of them needs. It returns at once
+// when RetryEnabled (the retry queue's TTL is the delay), when the backoff is
+// disabled, or when none of ds will be retried. It returns ctx's error if ctx
+// ends first.
+func waitBeforeRetry(ctx context.Context, cfg *Config, queue string, ds ...amqp.Delivery) error {
+	if cfg.RetryEnabled {
+		return nil
+	}
+	var delay time.Duration
+	for _, d := range ds {
+		if n := getRetryCount(d, queue); n < cfg.MaxRetries {
+			delay = max(delay, retryDelay(cfg.RetryBackoff, n))
+		}
+	}
+	if delay <= 0 {
+		return nil
+	}
+
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
 // handleFailedDelivery settles a delivery whose handler failed:
 //
-//   - under MaxRetries: Reject without requeue when RetryEnabled (the queue's
-//     DLX routes it through the TTL retry queue), else Nack with requeue;
-//   - at MaxRetries: publish a copy to "<queue>.parking-lot" and Ack when
-//     DeadLetterEnabled (Nack with requeue if that publish fails), else Reject.
+//   - under MaxRetries with RetryEnabled: Reject without requeue (the queue's
+//     DLX routes it through the TTL retry queue);
+//   - under MaxRetries without RetryEnabled: republish a copy to the queue with
+//     an incremented "x-retry-count" header and Ack the original (Nack with
+//     requeue if that publish fails), so the attempts are counted on any queue
+//     type;
+//   - at MaxRetries: settleExhausted.
 //
 // Rejecting at MaxRetries is not enough on its own: the DLX routes by the main
 // queue name, which leads back into the retry queue rather than the parking lot.
-func handleFailedDelivery(ctx context.Context, client *Client, logger *slog.Logger, d amqp.Delivery, queue string) {
-	cfg := client.config
+func handleFailedDelivery(ctx context.Context, cfg *Config, logger *slog.Logger, republish republishFunc, d amqp.Delivery, queue string) {
 	retryCount := getRetryCount(d, queue)
 
-	if retryCount < cfg.MaxRetries {
-		var err error
-		if cfg.RetryEnabled {
-			err = d.Reject(false)
-		} else {
-			err = d.Nack(false, true)
-		}
-		if err != nil {
+	if retryCount >= cfg.MaxRetries {
+		settleExhausted(ctx, cfg, logger, republish, d, queue, "max retries exceeded")
+		return
+	}
+
+	if cfg.RetryEnabled {
+		if err := d.Reject(false); err != nil {
 			logger.Error("failed to settle message for retry", "error", err)
 		}
 		logger.Debug("message scheduled for retry",
 			"queue", queue,
 			"retry_count", retryCount,
-			"via_dlx", cfg.RetryEnabled,
+			"via_dlx", true,
 		)
 		return
 	}
+
+	next := d
+	next.Headers = withRetryCount(d.Headers, retryCount+1)
+	if err := republish(ctx, queue, next); err != nil {
+		logger.Error("failed to republish message for retry, requeueing",
+			"queue", queue,
+			"retry_count", retryCount,
+			"error", err,
+		)
+		if nackErr := d.Nack(false, true); nackErr != nil {
+			logger.Error("failed to nack message", "error", nackErr)
+		}
+		return
+	}
+	if err := d.Ack(false); err != nil {
+		logger.Error("failed to ack message republished for retry", "error", err)
+	}
+	logger.Debug("message scheduled for retry",
+		"queue", queue,
+		"retry_count", retryCount,
+		"via_dlx", false,
+	)
+}
+
+// settleExhausted settles a delivery that will not be retried again: it is
+// published to "<queue>.parking-lot" and acked when DeadLetterEnabled (Nack
+// with requeue if that publish fails), and rejected otherwise.
+func settleExhausted(ctx context.Context, cfg *Config, logger *slog.Logger, republish republishFunc, d amqp.Delivery, queue, reason string) {
+	retryCount := getRetryCount(d, queue)
 
 	if !cfg.DeadLetterEnabled {
 		if err := d.Reject(false); err != nil {
 			logger.Error("failed to reject message", "error", err)
 		}
-		logger.Warn("message rejected (max retries exceeded)",
+		logger.Warn("message rejected ("+reason+")",
 			"queue", queue,
 			"retry_count", retryCount,
 			"max_retries", cfg.MaxRetries,
@@ -272,7 +400,7 @@ func handleFailedDelivery(ctx context.Context, client *Client, logger *slog.Logg
 	}
 
 	parkingLot := queue + parkingLotSuffix
-	if err := publishCopy(ctx, client, parkingLot, d); err != nil {
+	if err := republish(ctx, parkingLot, d); err != nil {
 		logger.Error("failed to move message to parking lot, requeueing",
 			"queue", queue,
 			"parking_lot", parkingLot,
@@ -286,7 +414,7 @@ func handleFailedDelivery(ctx context.Context, client *Client, logger *slog.Logg
 	if err := d.Ack(false); err != nil {
 		logger.Error("failed to ack message moved to parking lot", "error", err)
 	}
-	logger.Warn("message moved to parking lot (max retries exceeded)",
+	logger.Warn("message moved to parking lot ("+reason+")",
 		"queue", queue,
 		"parking_lot", parkingLot,
 		"retry_count", retryCount,
@@ -294,17 +422,23 @@ func handleFailedDelivery(ctx context.Context, client *Client, logger *slog.Logg
 	)
 }
 
-// publishCopy republishes d unchanged (body, properties and headers, including
-// x-death history) to queue via the default exchange, waiting for the broker
-// confirm when publisher confirms are enabled.
-func publishCopy(ctx context.Context, client *Client, queue string, d amqp.Delivery) error {
-	ch, err := client.GetPublisherChannel(ctx)
-	if err != nil {
-		return err
-	}
-	defer client.ReturnPublisherChannel(ch)
+// withRetryCount returns a copy of headers with the retry counter set to n.
+// The broker-managed x-delivery-count is dropped: n already includes it.
+func withRetryCount(headers amqp.Table, n int) amqp.Table {
+	out := amqp.Table{}
+	maps.Copy(out, headers)
+	delete(out, "x-delivery-count")
+	out[retryCountHeader] = int64(n)
+	return out
+}
 
-	dc, err := ch.PublishWithDeferredConfirmWithContext(ctx, "", queue, false, false, amqp.Publishing{
+// publishingFrom rebuilds d as a Publishing: body, headers (including x-death
+// history) and the properties that describe the message, Expiration included
+// so a per-message TTL survives a retry. UserId is left out on purpose: the
+// broker rejects a publish whose user-id differs from the connection's user,
+// which would break retries when producer and consumer use different accounts.
+func publishingFrom(d amqp.Delivery) amqp.Publishing {
+	return amqp.Publishing{
 		Headers:         d.Headers,
 		ContentType:     d.ContentType,
 		ContentEncoding: d.ContentEncoding,
@@ -312,12 +446,26 @@ func publishCopy(ctx context.Context, client *Client, queue string, d amqp.Deliv
 		Priority:        d.Priority,
 		CorrelationId:   d.CorrelationId,
 		ReplyTo:         d.ReplyTo,
+		Expiration:      d.Expiration,
 		MessageId:       d.MessageId,
 		Timestamp:       d.Timestamp,
 		Type:            d.Type,
 		AppId:           d.AppId,
 		Body:            d.Body,
-	})
+	}
+}
+
+// republish publishes d to queue via the default exchange, waiting for the
+// broker confirm when publisher confirms are enabled. A message with a
+// per-message TTL gets its full TTL again, since the broker counts from enqueue.
+func (c *Client) republish(ctx context.Context, queue string, d amqp.Delivery) error {
+	ch, err := c.GetPublisherChannel(ctx)
+	if err != nil {
+		return err
+	}
+	defer c.ReturnPublisherChannel(ch)
+
+	dc, err := ch.PublishWithDeferredConfirmWithContext(ctx, "", queue, false, false, publishingFrom(d))
 	if err != nil {
 		return err
 	}
@@ -326,28 +474,43 @@ func publishCopy(ctx context.Context, client *Client, queue string, d amqp.Deliv
 
 // getRetryCount returns how many times d has already failed on queue.
 //
-// It reads the "count" of the x-death entry for queue (incremented each time
-// the message is dead-lettered from it), falling back to the x-delivery-count
-// header that quorum queues set on redelivery after a requeue.
+// It takes the largest of three counters, each maintained by a different
+// retry path, so it never under-counts when a message has been through more
+// than one of them (for example after RetryEnabled was toggled between
+// deploys). Every delivery attempt counts, including a quorum redelivery after
+// a consumer crash, so a message can reach MaxRetries slightly early but never
+// late: the "count" of the x-death entry for queue (incremented each
+// time the message is dead-lettered from it, RetryEnabled), the x-retry-count
+// header (set by the client when it republishes, RetryEnabled=false) and the
+// x-delivery-count header that quorum queues set on redelivery.
 func getRetryCount(d amqp.Delivery, queue string) int {
-	if xDeath, ok := d.Headers["x-death"].([]any); ok {
-		for _, entry := range xDeath {
-			table, ok := entry.(amqp.Table)
-			if !ok {
-				continue
-			}
-			if q, _ := table["queue"].(string); q != queue {
-				continue
-			}
-			if n, ok := toInt(table["count"]); ok {
-				return n
-			}
+	count := xDeathCount(d.Headers, queue)
+	for _, header := range []string{retryCountHeader, "x-delivery-count"} {
+		if n, ok := toInt(d.Headers[header]); ok {
+			count = max(count, n)
 		}
 	}
-	if n, ok := toInt(d.Headers["x-delivery-count"]); ok {
-		return n
+	return count
+}
+
+// xDeathCount returns the "count" of the x-death entry the broker recorded for
+// queue, or 0 when the message was never dead-lettered from it.
+func xDeathCount(headers amqp.Table, queue string) int {
+	entries, _ := headers["x-death"].([]any)
+	count := 0
+	for _, entry := range entries {
+		table, ok := entry.(amqp.Table)
+		if !ok {
+			continue
+		}
+		if q, _ := table["queue"].(string); q != queue {
+			continue
+		}
+		if n, ok := toInt(table["count"]); ok {
+			count = max(count, n)
+		}
 	}
-	return 0
+	return count
 }
 
 func toInt(v any) (int, bool) {
@@ -376,8 +539,50 @@ func (c *Consumer) ConsumeWithDefaults(ctx context.Context, queueName string, ha
 	}, handler)
 }
 
-// BatchHandler is called with a batch of messages.
-type BatchHandler func(ctx context.Context, messages []any, deliveries []amqp.Delivery) error
+// BatchHandler is called with a batch of deliveries; each payload is the
+// delivery's Body, undecoded. Returning nil acks the whole batch. Returning an
+// error applies the retry policy of Config to every delivery of the batch.
+type BatchHandler func(ctx context.Context, deliveries []amqp.Delivery) error
+
+// JSONBatchHandler adapts a typed handler to a BatchHandler. Every body is
+// decoded into T with json.Unmarshal; msgs[i] belongs to deliveries[i].
+//
+// A body that does not decode fails the whole batch (the error wraps
+// ErrPoisonMessage), and the batch is retried as one. To keep malformed
+// messages out of batches in the first place, also give the BatchConsumer
+// WithBatchValidator(ValidJSON).
+func JSONBatchHandler[T any](fn func(ctx context.Context, msgs []T, deliveries []amqp.Delivery) error) BatchHandler {
+	return func(ctx context.Context, deliveries []amqp.Delivery) error {
+		msgs := make([]T, len(deliveries))
+		for i, d := range deliveries {
+			if err := json.Unmarshal(d.Body, &msgs[i]); err != nil {
+				return fmt.Errorf("%w: decode JSON body of message %d: %w", ErrPoisonMessage, i, err)
+			}
+		}
+		return fn(ctx, msgs, deliveries)
+	}
+}
+
+// ValidJSON is a BatchConsumer validator (see WithBatchValidator) that accepts
+// only deliveries whose body is valid JSON.
+func ValidJSON(d amqp.Delivery) error {
+	if !json.Valid(d.Body) {
+		return fmt.Errorf("%w: body is not valid JSON", ErrPoisonMessage)
+	}
+	return nil
+}
+
+// BatchOption configures a BatchConsumer.
+type BatchOption func(*BatchConsumer)
+
+// WithBatchValidator sets a check run on every delivery before it joins a
+// batch. A delivery that fails is settled on its own as a poison message
+// (parking lot when DeadLetterEnabled, rejected otherwise) and never reaches
+// the handler, so one bad message cannot fail the batch it would sit in.
+// Without a validator every delivery joins a batch.
+func WithBatchValidator(validate func(amqp.Delivery) error) BatchOption {
+	return func(bc *BatchConsumer) { bc.validate = validate }
+}
 
 // BatchConsumer handles batch message consumption.
 // It manages its own AMQP channel and ack lifecycle, avoiding double-ack issues.
@@ -387,35 +592,78 @@ type BatchConsumer struct {
 	tracer       trace.Tracer
 	batchSize    int
 	flushTimeout time.Duration
+	validate     func(amqp.Delivery) error
 }
 
 // NewBatchConsumer creates a batch consumer.
-func NewBatchConsumer(client *Client, logger *slog.Logger, batchSize int, flushTimeout time.Duration) *BatchConsumer {
-	return &BatchConsumer{
+func NewBatchConsumer(client *Client, logger *slog.Logger, batchSize int, flushTimeout time.Duration, opts ...BatchOption) *BatchConsumer {
+	bc := &BatchConsumer{
 		client:       client,
 		logger:       logger,
 		tracer:       otel.Tracer("rabbitmq-batch-consumer"),
 		batchSize:    batchSize,
 		flushTimeout: flushTimeout,
 	}
+	for _, opt := range opts {
+		opt(bc)
+	}
+	return bc
 }
 
 // StartBatchConsumer starts consuming messages in batches.
 // It creates its own channel and handles acking per-batch to avoid double-ack.
 func (bc *BatchConsumer) StartBatchConsumer(ctx context.Context, opts ConsumeOptions, handler BatchHandler) error {
-	ch, err := bc.client.CreateConsumerChannel()
+	ch, deliveries, err := bc.consume(opts)
 	if err != nil {
-		return fmt.Errorf("failed to create consumer channel: %w", err)
+		return err
 	}
 
-	batchSize := max(bc.batchSize, 1)
+	b := &batcher{bc: bc, queue: opts.QueueName, handler: handler}
+	flushTimer := time.NewTimer(bc.flushTimeout)
+	defer flushTimer.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			// Flush the remaining batch before exiting; ctx is already
+			// cancelled, so give the handler and acks a bounded detached context.
+			shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), bc.flushTimeout)
+			b.flushAndLog(shutdownCtx, "failed to flush batch on shutdown")
+			cancel()
+			_ = ch.Close()
+			return ctx.Err()
+
+		case <-flushTimer.C:
+			b.flushAndLog(ctx, "failed to flush batch on timeout")
+			flushTimer.Reset(bc.flushTimeout)
+
+		case delivery, ok := <-deliveries:
+			if !ok {
+				b.flushAndLog(ctx, "failed to flush batch on channel close")
+				_ = ch.Close()
+				return errDeliveryChannelClosed
+			}
+			if b.add(ctx, delivery) {
+				flushTimer.Reset(bc.flushTimeout)
+			}
+		}
+	}
+}
+
+// consume opens the batch consumer's channel and starts consuming opts.QueueName
+// with manual acks.
+func (bc *BatchConsumer) consume(opts ConsumeOptions) (*amqp.Channel, <-chan amqp.Delivery, error) {
+	ch, err := bc.client.CreateConsumerChannel()
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to create consumer channel: %w", err)
+	}
 
 	// Prefetch below the batch size would cap every batch at the prefetch and
 	// make each one wait for the flush timeout.
-	prefetchCount := max(bc.client.config.PrefetchCount, batchSize)
+	prefetchCount := max(bc.client.config.PrefetchCount, bc.size())
 	if err := ch.Qos(prefetchCount, 0, false); err != nil {
-		ch.Close()
-		return fmt.Errorf("failed to set QoS: %w", err)
+		_ = ch.Close()
+		return nil, nil, fmt.Errorf("failed to set QoS: %w", err)
 	}
 
 	deliveries, err := ch.Consume(
@@ -428,106 +676,101 @@ func (bc *BatchConsumer) StartBatchConsumer(ctx context.Context, opts ConsumeOpt
 		opts.Args,
 	)
 	if err != nil {
-		ch.Close()
-		return fmt.Errorf("failed to start consuming: %w", err)
+		_ = ch.Close()
+		return nil, nil, fmt.Errorf("failed to start consuming: %w", err)
 	}
 
 	bc.logger.Info("batch consumer started",
 		"queue", opts.QueueName,
-		"batch_size", batchSize,
+		"batch_size", bc.size(),
 		"flush_timeout", bc.flushTimeout,
 	)
+	return ch, deliveries, nil
+}
 
-	var batch []any
-	var batchDeliveries []amqp.Delivery
-	flushTimer := time.NewTimer(bc.flushTimeout)
-	defer flushTimer.Stop()
+// size is the number of deliveries that triggers a flush: at least one.
+func (bc *BatchConsumer) size() int { return max(bc.batchSize, 1) }
 
-	flush := func(ctx context.Context) error {
-		if len(batch) == 0 {
-			return nil
-		}
-		defer func() {
-			batch = nil
-			batchDeliveries = nil
-		}()
+// batcher accumulates the deliveries of one StartBatchConsumer run and settles
+// them a batch at a time. It is used from the run's goroutine only.
+type batcher struct {
+	bc      *BatchConsumer
+	queue   string
+	handler BatchHandler
+	pending []amqp.Delivery
+}
 
-		if err := handler(ctx, batch, batchDeliveries); err != nil {
-			// Apply the retry policy per message so a failing batch cannot
-			// hot-loop through immediate requeues.
-			for _, d := range batchDeliveries {
-				handleFailedDelivery(ctx, bc.client, bc.logger, d, opts.QueueName)
-			}
-			return fmt.Errorf("batch handler error: %w", err)
-		}
-
-		// This consumer owns the channel and settles deliveries in order, so a
-		// single multiple-ack on the last tag acks the whole batch.
-		if ackErr := batchDeliveries[len(batchDeliveries)-1].Ack(true); ackErr != nil {
-			bc.logger.Error("failed to ack batch", "error", ackErr)
-		}
-		return nil
+// add appends delivery to the batch unless it is invalid, flushing when the
+// batch is full. It reports whether a flush happened.
+func (b *batcher) add(ctx context.Context, delivery amqp.Delivery) (flushed bool) {
+	if !b.accept(ctx, delivery) {
+		return false
 	}
 
-	for {
-		select {
-		case <-ctx.Done():
-			// Flush remaining batch before exiting; ctx is already cancelled,
-			// so give the handler and acks a bounded detached context.
-			shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), bc.flushTimeout)
-			if flushErr := flush(shutdownCtx); flushErr != nil {
-				bc.logger.Error("failed to flush batch on shutdown", "error", flushErr)
-			}
-			cancel()
-			ch.Close()
-			return ctx.Err()
+	b.pending = append(b.pending, delivery)
+	if len(b.pending) < b.bc.size() {
+		return false
+	}
+	b.flushAndLog(ctx, "failed to flush full batch")
+	return true
+}
 
-		case <-flushTimer.C:
-			if err := flush(ctx); err != nil {
-				bc.logger.Error("failed to flush batch on timeout", "error", err)
-			}
-			flushTimer.Reset(bc.flushTimeout)
+// accept reports whether delivery may join the batch. An invalid delivery is
+// settled on its own as a poison message and never reaches the handler.
+func (b *batcher) accept(ctx context.Context, delivery amqp.Delivery) bool {
+	bc := b.bc
 
-		case delivery, ok := <-deliveries:
-			if !ok {
-				if flushErr := flush(ctx); flushErr != nil {
-					bc.logger.Error("failed to flush batch on channel close", "error", flushErr)
-				}
-				ch.Close()
-				return fmt.Errorf("delivery channel closed")
-			}
+	msgCtx := otel.GetTextMapPropagator().Extract(ctx, traceCarrier(delivery.Headers))
+	_, span := bc.tracer.Start(msgCtx, "rabbitmq.batch-consume")
+	defer span.End()
 
-			// Extract trace context
-			carrier := propagation.MapCarrier{}
-			for k, v := range delivery.Headers {
-				if strVal, ok := v.(string); ok {
-					carrier[k] = strVal
-				}
-			}
-			msgCtx := otel.GetTextMapPropagator().Extract(ctx, carrier)
-			_, span := bc.tracer.Start(msgCtx, "rabbitmq.batch-consume")
+	if bc.validate == nil {
+		return true
+	}
+	err := bc.validate(delivery)
+	if err == nil {
+		return true
+	}
 
-			var msg any
-			if err := json.Unmarshal(delivery.Body, &msg); err != nil {
-				span.RecordError(err)
-				span.End()
-				// Reject poison pill without requeue
-				if rejectErr := delivery.Reject(false); rejectErr != nil {
-					bc.logger.Error("failed to reject poison message", "error", rejectErr)
-				}
-				continue
-			}
+	span.RecordError(err)
+	bc.logger.Warn("invalid message, not batched", "queue", b.queue, "error", err)
+	settleExhausted(ctx, bc.client.config, bc.logger, bc.client.republish, delivery, b.queue, "invalid message")
+	return false
+}
 
-			span.End()
-			batch = append(batch, msg)
-			batchDeliveries = append(batchDeliveries, delivery)
+// flush hands the pending deliveries to the handler and settles them. On a
+// handler error the retry policy is applied to each delivery.
+func (b *batcher) flush(ctx context.Context) error {
+	if len(b.pending) == 0 {
+		return nil
+	}
+	batch := b.pending
+	b.pending = nil
 
-			if len(batch) >= batchSize {
-				if err := flush(ctx); err != nil {
-					bc.logger.Error("failed to flush full batch", "error", err)
-				}
-				flushTimer.Reset(bc.flushTimeout)
-			}
+	if err := b.handler(ctx, batch); err != nil {
+		// Apply the retry policy per message so a failing batch cannot
+		// hot-loop through immediate requeues, after one backoff for the batch.
+		if werr := waitBeforeRetry(ctx, b.bc.client.config, b.queue, batch...); werr != nil {
+			b.bc.logger.Warn("retry wait interrupted, leaving batch unacked", "queue", b.queue, "error", werr)
+			return fmt.Errorf("batch handler error: %w", err)
 		}
+		for _, d := range batch {
+			handleFailedDelivery(ctx, b.bc.client.config, b.bc.logger, b.bc.client.republish, d, b.queue)
+		}
+		return fmt.Errorf("batch handler error: %w", err)
+	}
+
+	// This consumer owns the channel and settles deliveries in order, so a
+	// single multiple-ack on the last tag acks the whole batch.
+	if err := batch[len(batch)-1].Ack(true); err != nil {
+		b.bc.logger.Error("failed to ack batch", "error", err)
+	}
+	return nil
+}
+
+// flushAndLog flushes the batch and logs a failure under msg.
+func (b *batcher) flushAndLog(ctx context.Context, msg string) {
+	if err := b.flush(ctx); err != nil {
+		b.bc.logger.Error(msg, "error", err)
 	}
 }

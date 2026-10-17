@@ -1,3 +1,3 @@
-module github.com/Chandra179/gosdk
+module logger
 
 go 1.27.2

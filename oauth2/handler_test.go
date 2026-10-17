@@ -5,19 +5,18 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 	"time"
 
-	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 const testStateCookie = "oauth2_state"
 
-func setupTestRouter() *gin.Engine {
-	gin.SetMode(gin.TestMode)
-	return gin.New()
+func setupTestRouter() *http.ServeMux {
+	return http.NewServeMux()
 }
 
 // newCallbackRequest builds a callback request; cookieState is sent as the state cookie when non-empty
@@ -58,10 +57,10 @@ func TestGoogleCallbackHandler_MissingParams(t *testing.T) {
 		return &CallbackInfo{}, nil
 	}
 
-	manager, err := NewManager(context.Background(), config)
+	manager, err := NewManager(config)
 	require.NoError(t, err)
 
-	router.GET("/callback", GoogleCallbackHandler(manager, nil))
+	router.HandleFunc("GET /callback", GoogleCallbackHandler(manager, nil))
 
 	// Test missing code
 	w := httptest.NewRecorder()
@@ -89,14 +88,14 @@ func TestGoogleCallbackHandler_InvalidState(t *testing.T) {
 		return &CallbackInfo{}, nil
 	}
 
-	manager, err := NewManager(context.Background(), config)
+	manager, err := NewManager(config)
 	require.NoError(t, err)
 
 	// Register provider
 	mockProvider := &MockProvider{name: "google", authURL: "https://example.com/auth"}
 	manager.RegisterProvider(mockProvider)
 
-	router.GET("/callback", GoogleCallbackHandler(manager, nil))
+	router.HandleFunc("GET /callback", GoogleCallbackHandler(manager, nil))
 
 	// Cookie matches the query, but the state was never issued by the manager
 	w := httptest.NewRecorder()
@@ -128,7 +127,7 @@ func TestGoogleCallbackHandler_StateCookie(t *testing.T) {
 				return &CallbackInfo{SessionCookieName: "session", SessionID: "abc"}, nil
 			}
 
-			manager, err := NewManager(context.Background(), config)
+			manager, err := NewManager(config)
 			require.NoError(t, err)
 			t.Cleanup(manager.Cleanup)
 			manager.RegisterProvider(&MockProvider{name: "google", authURL: "https://example.com/auth"})
@@ -136,7 +135,7 @@ func TestGoogleCallbackHandler_StateCookie(t *testing.T) {
 			_, state, err := manager.GetAuthURLWithState("google")
 			require.NoError(t, err)
 
-			router.GET("/callback", GoogleCallbackHandler(manager, nil))
+			router.HandleFunc("GET /callback", GoogleCallbackHandler(manager, nil))
 
 			w := httptest.NewRecorder()
 			router.ServeHTTP(w, newCallbackRequest(t, "code=auth-code&state="+state, tt.cookieState(state)))
@@ -165,7 +164,7 @@ func TestGoogleCallbackHandler_Success(t *testing.T) {
 		return expectedCallbackInfo, nil
 	}
 
-	manager, err := NewManager(context.Background(), config)
+	manager, err := NewManager(config)
 	require.NoError(t, err)
 
 	// Register mock provider
@@ -176,7 +175,7 @@ func TestGoogleCallbackHandler_Success(t *testing.T) {
 	manager.RegisterProvider(mockProvider)
 
 	// Generate valid state
-	authURL, err := manager.GetAuthURL("google")
+	authURL, _, err := manager.GetAuthURLWithState("google")
 	require.NoError(t, err)
 	state := extractStateFromURL(authURL)
 
@@ -186,7 +185,7 @@ func TestGoogleCallbackHandler_Success(t *testing.T) {
 		RequestTimeout: 30 * time.Second,
 	}
 
-	router.GET("/callback", GoogleCallbackHandler(manager, handlerConfig))
+	router.HandleFunc("GET /callback", GoogleCallbackHandler(manager, handlerConfig))
 
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, newCallbackRequest(t, "code=auth-code&state="+state, state))
@@ -216,7 +215,7 @@ func TestGoogleCallbackHandler_CallbackHandlerError(t *testing.T) {
 		return nil, errors.New("callback error")
 	}
 
-	manager, err := NewManager(context.Background(), config)
+	manager, err := NewManager(config)
 	require.NoError(t, err)
 
 	mockProvider := &MockProvider{
@@ -225,11 +224,11 @@ func TestGoogleCallbackHandler_CallbackHandlerError(t *testing.T) {
 	}
 	manager.RegisterProvider(mockProvider)
 
-	authURL, err := manager.GetAuthURL("google")
+	authURL, _, err := manager.GetAuthURLWithState("google")
 	require.NoError(t, err)
 	state := extractStateFromURL(authURL)
 
-	router.GET("/callback", GoogleCallbackHandler(manager, nil))
+	router.HandleFunc("GET /callback", GoogleCallbackHandler(manager, nil))
 
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, newCallbackRequest(t, "code=auth-code&state="+state, state))
@@ -251,7 +250,7 @@ func TestGoogleCallbackHandler_Timeout(t *testing.T) {
 		}
 	}
 
-	manager, err := NewManager(context.Background(), config)
+	manager, err := NewManager(config)
 	require.NoError(t, err)
 
 	mockProvider := &MockProvider{
@@ -269,7 +268,7 @@ func TestGoogleCallbackHandler_Timeout(t *testing.T) {
 	}
 	manager.RegisterProvider(mockProvider)
 
-	authURL, err := manager.GetAuthURL("google")
+	authURL, _, err := manager.GetAuthURLWithState("google")
 	require.NoError(t, err)
 	state := extractStateFromURL(authURL)
 
@@ -278,7 +277,7 @@ func TestGoogleCallbackHandler_Timeout(t *testing.T) {
 		RequestTimeout: 50 * time.Millisecond,
 	}
 
-	router.GET("/callback", GoogleCallbackHandler(manager, handlerConfig))
+	router.HandleFunc("GET /callback", GoogleCallbackHandler(manager, handlerConfig))
 
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, newCallbackRequest(t, "code=auth-code&state="+state, state))
@@ -299,7 +298,7 @@ func TestGoogleCallbackHandler_ZeroConfigUsesDefaults(t *testing.T) {
 		return &CallbackInfo{SessionCookieName: "session", SessionID: "abc", CookieMaxAge: 3600}, nil
 	}
 
-	manager, err := NewManager(context.Background(), config)
+	manager, err := NewManager(config)
 	require.NoError(t, err)
 	t.Cleanup(manager.Cleanup)
 	manager.RegisterProvider(&MockProvider{name: "google", authURL: "https://example.com/auth"})
@@ -308,7 +307,7 @@ func TestGoogleCallbackHandler_ZeroConfigUsesDefaults(t *testing.T) {
 	require.NoError(t, err)
 
 	// Zero-value config: RequestTimeout 0 must not expire the context immediately
-	router.GET("/callback", GoogleCallbackHandler(manager, &HandlerConfig{}))
+	router.HandleFunc("GET /callback", GoogleCallbackHandler(manager, &HandlerConfig{}))
 
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, newCallbackRequest(t, "code=auth-code&state="+state, state))
@@ -358,7 +357,7 @@ func TestGoogleCallbackHandler_DefaultConfig(t *testing.T) {
 		}, nil
 	}
 
-	manager, err := NewManager(context.Background(), config)
+	manager, err := NewManager(config)
 	require.NoError(t, err)
 
 	mockProvider := &MockProvider{
@@ -367,12 +366,12 @@ func TestGoogleCallbackHandler_DefaultConfig(t *testing.T) {
 	}
 	manager.RegisterProvider(mockProvider)
 
-	authURL, err := manager.GetAuthURL("google")
+	authURL, _, err := manager.GetAuthURLWithState("google")
 	require.NoError(t, err)
 	state := extractStateFromURL(authURL)
 
 	// Pass nil config to use defaults
-	router.GET("/callback", GoogleCallbackHandler(manager, nil))
+	router.HandleFunc("GET /callback", GoogleCallbackHandler(manager, nil))
 
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, newCallbackRequest(t, "code=auth-code&state="+state, state))
@@ -389,14 +388,14 @@ func TestGoogleCallbackHandler_DefaultConfig(t *testing.T) {
 func TestGoogleLoginHandler_SetsStateCookieAndRedirects(t *testing.T) {
 	router := setupTestRouter()
 
-	manager, err := NewManager(context.Background(), &ManagerConfig{
+	manager, err := NewManager(&ManagerConfig{
 		CallbackHandler: mockCallbackHandler(&CallbackInfo{}, nil),
 	})
 	require.NoError(t, err)
 	t.Cleanup(manager.Cleanup)
 	manager.RegisterProvider(&MockProvider{name: "google", authURL: "https://example.com/auth"})
 
-	router.GET("/login", GoogleLoginHandler(manager, nil))
+	router.HandleFunc("GET /login", GoogleLoginHandler(manager, nil))
 
 	w := httptest.NewRecorder()
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "/login", nil)
@@ -420,7 +419,7 @@ func TestGoogleLoginHandler_SetsStateCookieAndRedirects(t *testing.T) {
 func TestGoogleLoginHandler_FullFlowWithCallback(t *testing.T) {
 	router := setupTestRouter()
 
-	manager, err := NewManager(context.Background(), &ManagerConfig{
+	manager, err := NewManager(&ManagerConfig{
 		CallbackHandler: mockCallbackHandler(&CallbackInfo{SessionCookieName: "session", SessionID: "abc", UserID: "u1"}, nil),
 	})
 	require.NoError(t, err)
@@ -428,8 +427,8 @@ func TestGoogleLoginHandler_FullFlowWithCallback(t *testing.T) {
 	manager.RegisterProvider(&MockProvider{name: "google", authURL: "https://example.com/auth"})
 
 	handlerConfig := &HandlerConfig{SecureCookies: false, StateCookieName: "custom_state"}
-	router.GET("/login", GoogleLoginHandler(manager, handlerConfig))
-	router.GET("/callback", GoogleCallbackHandler(manager, handlerConfig))
+	router.HandleFunc("GET /login", GoogleLoginHandler(manager, handlerConfig))
+	router.HandleFunc("GET /callback", GoogleCallbackHandler(manager, handlerConfig))
 
 	w := httptest.NewRecorder()
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "/login", nil)
@@ -457,13 +456,13 @@ func TestGoogleLoginHandler_FullFlowWithCallback(t *testing.T) {
 func TestGoogleLoginHandler_Errors(t *testing.T) {
 	t.Run("provider not registered", func(t *testing.T) {
 		router := setupTestRouter()
-		manager, err := NewManager(context.Background(), &ManagerConfig{
+		manager, err := NewManager(&ManagerConfig{
 			CallbackHandler: mockCallbackHandler(&CallbackInfo{}, nil),
 		})
 		require.NoError(t, err)
 		t.Cleanup(manager.Cleanup)
 
-		router.GET("/login", GoogleLoginHandler(manager, nil))
+		router.HandleFunc("GET /login", GoogleLoginHandler(manager, nil))
 
 		w := httptest.NewRecorder()
 		req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "/login", nil)
@@ -476,7 +475,7 @@ func TestGoogleLoginHandler_Errors(t *testing.T) {
 
 	t.Run("state store full", func(t *testing.T) {
 		router := setupTestRouter()
-		manager, err := NewManager(context.Background(), &ManagerConfig{
+		manager, err := NewManager(&ManagerConfig{
 			CallbackHandler: mockCallbackHandler(&CallbackInfo{}, nil),
 			MaxStateEntries: 1,
 		})
@@ -484,7 +483,7 @@ func TestGoogleLoginHandler_Errors(t *testing.T) {
 		t.Cleanup(manager.Cleanup)
 		manager.RegisterProvider(&MockProvider{name: "google", authURL: "https://example.com/auth"})
 
-		router.GET("/login", GoogleLoginHandler(manager, nil))
+		router.HandleFunc("GET /login", GoogleLoginHandler(manager, nil))
 
 		codes := make([]int, 2)
 		for i := range codes {
@@ -497,4 +496,46 @@ func TestGoogleLoginHandler_Errors(t *testing.T) {
 
 		assert.Equal(t, []int{http.StatusFound, http.StatusServiceUnavailable}, codes)
 	})
+}
+
+func TestGoogleCallbackHandler_SessionCookieValueIsURLEscaped(t *testing.T) {
+	const sessionID = "a+b/c=d e;f"
+
+	manager, err := NewManager(&ManagerConfig{
+		CallbackHandler: mockCallbackHandler(&CallbackInfo{SessionCookieName: "session", SessionID: sessionID, UserID: "u1"}, nil),
+	})
+	require.NoError(t, err)
+	t.Cleanup(manager.Cleanup)
+	manager.RegisterProvider(&MockProvider{name: "google", authURL: "https://example.com/auth"})
+
+	_, state, err := manager.GetAuthURLWithState("google")
+	require.NoError(t, err)
+
+	router := setupTestRouter()
+	router.HandleFunc("GET /callback", GoogleCallbackHandler(manager, nil))
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, newCallbackRequest(t, "code=auth-code&state="+state, state))
+	require.Equal(t, http.StatusOK, w.Code)
+
+	session := findCookie(w, "session")
+	require.NotNil(t, session)
+	assert.NotEqual(t, sessionID, session.Value, "the wire value is escaped so it survives cookie syntax")
+	got, err := url.QueryUnescape(session.Value)
+	require.NoError(t, err)
+	assert.Equal(t, sessionID, got)
+}
+
+func TestHandlers_ErrorResponsesAreJSON(t *testing.T) {
+	manager, err := NewManager(&ManagerConfig{
+		CallbackHandler: mockCallbackHandler(&CallbackInfo{}, nil),
+	})
+	require.NoError(t, err)
+	t.Cleanup(manager.Cleanup)
+
+	w := httptest.NewRecorder()
+	GoogleCallbackHandler(manager, nil)(w, newCallbackRequest(t, "", ""))
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Equal(t, "application/json; charset=utf-8", w.Header().Get("Content-Type"))
+	assert.JSONEq(t, `{"error":"missing code or state parameter"}`, w.Body.String())
 }

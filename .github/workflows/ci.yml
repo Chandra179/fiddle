@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Every subdirectory is its own Go module, so each job is a matrix over modules
+# and runs inside that module's directory. Third-party actions are pinned to the
+# commit of the release tag shown in the trailing comment.
+jobs:
+  check:
+    name: check (${{ matrix.module }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [db, cache, kafka, rabbitmq, logger, oauth2, i18n, cryptoutil]
+    defaults:
+      run:
+        working-directory: ${{ matrix.module }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: ${{ matrix.module }}/go.mod
+          cache-dependency-path: ${{ matrix.module }}/go.sum
+
+      # The same targets run locally with `make check` (see Makefile.common).
+      - name: Tidy, vet and unit tests with the race detector
+        run: make tidy vet test-race
+
+      - uses: golangci/golangci-lint-action@4afd733a84b1f43292c63897423277bb7f4313a9 # v8
+        with:
+          version: v2.14.0
+          working-directory: ${{ matrix.module }}
+
+      - name: govulncheck
+        run: make vuln
+
+  # Integration tests. db, cache, kafka and rabbitmq start their dependencies
+  # with testcontainers (Docker is available on ubuntu-latest); oauth2 and i18n
+  # use in-process fakes.
+  integration:
+    name: integration (${{ matrix.module }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [db, cache, kafka, rabbitmq, oauth2, i18n]
+    defaults:
+      run:
+        working-directory: ${{ matrix.module }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: ${{ matrix.module }}/go.mod
+          cache-dependency-path: ${{ matrix.module }}/go.sum
+
+      - name: Integration tests
+        run: go test -tags integration -v -count=1 -timeout 300s ./...

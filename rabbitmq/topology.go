@@ -1,6 +1,7 @@
 package rabbitmq
 
 import (
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -18,22 +19,16 @@ func NewTopologyManager(client *Client) TopologyDeclarer {
 	return &TopologyManager{client: client}
 }
 
-// DeclareQueue declares a queue with the given configuration
-func (tm *TopologyManager) DeclareQueue(config QueueConfig) (*amqp.Queue, error) {
-	ch, err := tm.client.CreateConsumerChannel()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create channel: %w", err)
-	}
-	defer ch.Close()
-
-	// Add quorum queue argument if needed. Clone so the caller's map (and
-	// the cached config) is never mutated.
+// declareQueueOn declares the queue on ch. It clones the caller's Args so the
+// caller's map (and the cached config) is never mutated.
+func (c *Client) declareQueueOn(ch *amqp.Channel, config QueueConfig) (amqp.Queue, error) {
 	args := maps.Clone(config.Args)
 	if args == nil {
 		args = make(map[string]any)
 	}
 
-	if tm.client.config.QueueType == QueueTypeQuorum && config.Durable {
+	// Add quorum queue argument if needed
+	if c.config.QueueType == QueueTypeQuorum && config.Durable {
 		args["x-queue-type"] = "quorum"
 	}
 
@@ -46,7 +41,54 @@ func (tm *TopologyManager) DeclareQueue(config QueueConfig) (*amqp.Queue, error)
 		args,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to declare queue %s: %w", config.Name, err)
+		return amqp.Queue{}, fmt.Errorf("failed to declare queue %s: %w", config.Name, err)
+	}
+	return queue, nil
+}
+
+// declareExchangeOn declares the exchange on ch.
+func declareExchangeOn(ch *amqp.Channel, config ExchangeConfig) error {
+	err := ch.ExchangeDeclare(
+		config.Name,
+		config.Kind,
+		config.Durable,
+		config.AutoDelete,
+		config.Internal,
+		config.NoWait,
+		config.Args,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to declare exchange %s: %w", config.Name, err)
+	}
+	return nil
+}
+
+// bindQueueOn binds a queue to an exchange on ch.
+func bindQueueOn(ch *amqp.Channel, config BindingConfig) error {
+	err := ch.QueueBind(
+		config.QueueName,
+		config.RoutingKey,
+		config.Exchange,
+		config.NoWait,
+		config.Args,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to bind queue %s to exchange %s: %w", config.QueueName, config.Exchange, err)
+	}
+	return nil
+}
+
+// DeclareQueue declares a queue with the given configuration
+func (tm *TopologyManager) DeclareQueue(config QueueConfig) (*amqp.Queue, error) {
+	ch, err := tm.client.CreateConsumerChannel()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create channel: %w", err)
+	}
+	defer func() { _ = ch.Close() }()
+
+	queue, err := tm.client.declareQueueOn(ch, config)
+	if err != nil {
+		return nil, err
 	}
 
 	// Cache the topology
@@ -66,19 +108,10 @@ func (tm *TopologyManager) DeclareExchange(config ExchangeConfig) error {
 	if err != nil {
 		return fmt.Errorf("failed to create channel: %w", err)
 	}
-	defer ch.Close()
+	defer func() { _ = ch.Close() }()
 
-	err = ch.ExchangeDeclare(
-		config.Name,
-		config.Kind,
-		config.Durable,
-		config.AutoDelete,
-		config.Internal,
-		config.NoWait,
-		config.Args,
-	)
-	if err != nil {
-		return fmt.Errorf("failed to declare exchange %s: %w", config.Name, err)
+	if err := declareExchangeOn(ch, config); err != nil {
+		return err
 	}
 
 	// Cache the topology
@@ -98,17 +131,10 @@ func (tm *TopologyManager) BindQueue(config BindingConfig) error {
 	if err != nil {
 		return fmt.Errorf("failed to create channel: %w", err)
 	}
-	defer ch.Close()
+	defer func() { _ = ch.Close() }()
 
-	err = ch.QueueBind(
-		config.QueueName,
-		config.RoutingKey,
-		config.Exchange,
-		config.NoWait,
-		config.Args,
-	)
-	if err != nil {
-		return fmt.Errorf("failed to bind queue %s to exchange %s: %w", config.QueueName, config.Exchange, err)
+	if err := bindQueueOn(ch, config); err != nil {
+		return err
 	}
 
 	// Cache the topology
@@ -136,49 +162,106 @@ func upsert[T any](s []T, v T, same func(T) bool) []T {
 	return append(s, v)
 }
 
-// restoreTopology re-declares all cached topology after reconnection.
-// It resets the cache before re-declaring so entries are not duplicated on each reconnect.
+// restoreTopology re-declares all cached topology on the current connections.
+// connect calls it while the client is still StateConnecting, before consumers
+// that wait on IsHealthy are released.
+//
+// A declaration the broker rejects (for example PRECONDITION_FAILED because a
+// queue exists with different arguments) is logged and skipped: retrying cannot
+// fix a conflicting definition, and one bad entry must not keep the whole client
+// unhealthy. Anything else, such as the connection dropping, is returned so the
+// reconnect attempt fails and is retried. The cache is only read, never reset,
+// so skipped entries are tried again on the next reconnect.
 func (c *Client) restoreTopology() error {
-	// Snapshot and reset cache atomically so DeclareQueue/Exchange/BindQueue
-	// re-populate with exactly the same entries (no unbounded growth).
-	c.topology.mu.Lock()
-	exchanges := make([]ExchangeConfig, len(c.topology.exchanges))
-	queues := make([]QueueConfig, len(c.topology.queues))
-	bindings := make([]BindingConfig, len(c.topology.bindings))
-	copy(exchanges, c.topology.exchanges)
-	copy(queues, c.topology.queues)
-	copy(bindings, c.topology.bindings)
-	c.topology.queues = c.topology.queues[:0]
-	c.topology.exchanges = c.topology.exchanges[:0]
-	c.topology.bindings = c.topology.bindings[:0]
-	c.topology.mu.Unlock()
+	c.topology.mu.RLock()
+	exchanges := slices.Clone(c.topology.exchanges)
+	queues := slices.Clone(c.topology.queues)
+	bindings := slices.Clone(c.topology.bindings)
+	c.topology.mu.RUnlock()
 
-	tm := NewTopologyManager(c)
+	if len(exchanges)+len(queues)+len(bindings) == 0 {
+		return nil
+	}
+
+	skipped := 0
+	restore := func(what string, declare func(*amqp.Channel) error) error {
+		ok, err := c.restoreOne(what, declare)
+		if !ok {
+			skipped++
+		}
+		return err
+	}
 
 	for _, exchange := range exchanges {
-		if err := tm.DeclareExchange(exchange); err != nil {
+		if err := restore("exchange "+exchange.Name, func(ch *amqp.Channel) error {
+			return declareExchangeOn(ch, exchange)
+		}); err != nil {
 			return err
 		}
 	}
 
 	for _, queue := range queues {
-		if _, err := tm.DeclareQueue(queue); err != nil {
+		if err := restore("queue "+queue.Name, func(ch *amqp.Channel) error {
+			_, err := c.declareQueueOn(ch, queue)
+			return err
+		}); err != nil {
 			return err
 		}
 	}
 
 	for _, binding := range bindings {
-		if err := tm.BindQueue(binding); err != nil {
+		if err := restore("binding "+binding.QueueName+" -> "+binding.Exchange, func(ch *amqp.Channel) error {
+			return bindQueueOn(ch, binding)
+		}); err != nil {
 			return err
 		}
 	}
 
-	c.logger.Info("topology restored successfully",
+	c.logger.Info("topology restored",
 		"exchanges", len(exchanges),
 		"queues", len(queues),
 		"bindings", len(bindings),
+		"skipped", skipped,
 	)
 	return nil
+}
+
+// restoreOne runs one declaration on a channel of its own, since a rejected
+// declaration closes its channel. It reports whether the entry was restored; a
+// false result with a nil error means the broker rejected it and it was skipped.
+func (c *Client) restoreOne(what string, declare func(*amqp.Channel) error) (bool, error) {
+	ch, err := c.openConsumerChannel()
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = ch.Close() }()
+
+	err = declare(ch)
+	if err == nil {
+		return true, nil
+	}
+	if isBrokerRejection(err) && !c.consumerConnClosed() {
+		c.logger.Error("broker rejected topology entry, skipping it", "entry", what, "error", err)
+		return false, nil
+	}
+	return false, err
+}
+
+// isBrokerRejection reports whether err is the broker refusing a single
+// operation (a server-initiated channel exception), as opposed to a transport
+// failure.
+func isBrokerRejection(err error) bool {
+	amqpErr, ok := errors.AsType[*amqp.Error](err)
+	return ok && amqpErr.Server
+}
+
+// consumerConnClosed reports whether the consumer connection is gone. A broker
+// that closes the whole connection also sets amqp.Error.Server, so this tells a
+// rejected entry apart from a dead connection.
+func (c *Client) consumerConnClosed() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.consumerConn == nil || c.consumerConn.IsClosed()
 }
 
 // SetupDeadLetterExchange creates a DLX with retry and parking lot queues

@@ -8,15 +8,8 @@ import (
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
+	"go.opentelemetry.io/otel/trace"
 )
-
-// CommitMode defines when offsets are committed.
-type CommitMode int
-
-// CommitRecord commits the offsets of successfully processed records once per poll.
-// Ensures no message loss during shutdown - in-flight messages won't be committed
-// and will be redelivered on restart (at-least-once delivery semantics).
-const CommitRecord CommitMode = iota
 
 // commitTimeout bounds the offset commit issued after each poll.
 const commitTimeout = 10 * time.Second
@@ -62,12 +55,14 @@ func NewConsumer(client *kgo.Client, opts ...ConsumerOptions) Consumer {
 // Start begins consuming messages and processing them with the handler.
 // It blocks until the context is cancelled or the client is closed.
 //
-// Offsets of processed records are committed once per poll. If a DLQ producer is
+// Offsets of processed records are committed once per poll, so records that were
+// still in flight at shutdown stay uncommitted and are redelivered on restart
+// (at-least-once delivery). If a DLQ producer is
 // configured and publishing a failed record to it fails, Start returns an error
 // wrapping ErrDLQPublish without committing that record or any later one.
 // The client has already fetched past those records, so close it (leaving the
 // group) and create a new one; the uncommitted records are then redelivered.
-func (c *consumer) Start(ctx context.Context, handler func(*kgo.Record) error) error {
+func (c *consumer) Start(ctx context.Context, handler Handler) error {
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -90,7 +85,7 @@ func (c *consumer) Start(ctx context.Context, handler func(*kgo.Record) error) e
 
 // processFetches handles every record of one poll in order and commits the ones
 // that were processed. It stops at the first record that must not be committed.
-func (c *consumer) processFetches(ctx context.Context, fetches kgo.Fetches, handler func(*kgo.Record) error) error {
+func (c *consumer) processFetches(ctx context.Context, fetches kgo.Fetches, handler Handler) error {
 	logger := c.options.Logger
 
 	// A fetch error on one partition must not drop records fetched from healthy ones.
@@ -129,7 +124,7 @@ func (c *consumer) processFetches(ctx context.Context, fetches kgo.Fetches, hand
 
 // handleRecord runs handler with retries and routes a final failure to the DLQ.
 // A non-nil error means the record must not be committed.
-func (c *consumer) handleRecord(ctx context.Context, r *kgo.Record, handler func(*kgo.Record) error) error {
+func (c *consumer) handleRecord(ctx context.Context, r *kgo.Record, handler Handler) error {
 	logger := c.options.Logger
 
 	var lastErr error
@@ -143,8 +138,14 @@ func (c *consumer) handleRecord(ctx context.Context, r *kgo.Record, handler func
 			}
 		}
 
-		if lastErr = handler(r); lastErr == nil {
+		if lastErr = handler(recordContext(ctx, r), r); lastErr == nil {
 			return nil
+		}
+		// A handler that failed because Start's ctx was cancelled did not fail
+		// on its merits: neither retry it nor dead-letter the record. It stays
+		// uncommitted and is redelivered after restart.
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 		logger.Warn("handler error, retrying",
 			"topic", r.Topic,
@@ -156,23 +157,31 @@ func (c *consumer) handleRecord(ctx context.Context, r *kgo.Record, handler func
 		)
 	}
 
+	return c.deadLetter(ctx, r, lastErr)
+}
+
+// deadLetter publishes a record whose handler kept failing to the DLQ. A
+// non-nil error means the record must not be committed.
+func (c *consumer) deadLetter(ctx context.Context, r *kgo.Record, handlerErr error) error {
+	logger := c.options.Logger
+
 	if c.options.DLQProducer == nil {
 		logger.Error("handler failed, no DLQ configured",
 			"topic", r.Topic,
 			"partition", r.Partition,
 			"offset", r.Offset,
-			"error", lastErr,
+			"error", handlerErr,
 		)
 		return nil
 	}
 
-	if err := c.options.DLQProducer.SendToDLQ(ctx, r.Topic, r.Value, r.Key, lastErr); err != nil {
+	if err := c.options.DLQProducer.SendToDLQ(ctx, r.Topic, r.Value, r.Key, handlerErr); err != nil {
 		logger.Error("failed to send message to DLQ",
 			"error", err,
 			"topic", r.Topic,
 			"partition", r.Partition,
 			"offset", r.Offset,
-			"dlq_error", lastErr,
+			"dlq_error", handlerErr,
 		)
 		return fmt.Errorf("%w: topic %s partition %d offset %d: %w", ErrDLQPublish, r.Topic, r.Partition, r.Offset, err)
 	}
@@ -181,29 +190,24 @@ func (c *consumer) handleRecord(ctx context.Context, r *kgo.Record, handler func
 		"topic", r.Topic,
 		"partition", r.Partition,
 		"offset", r.Offset,
-		"dlq_topic", r.Topic+".dlq",
-		"error", lastErr,
+		"dlq_topic", dlqTopic(r.Topic),
+		"error", handlerErr,
 	)
 	if c.options.OnDLQPublish != nil {
-		c.options.OnDLQPublish(r.Topic, lastErr)
+		c.options.OnDLQPublish(r.Topic, handlerErr)
 	}
 	return nil
 }
 
-// StartConsumer starts consuming messages and processing them with the handler.
-//
-// Deprecated: Use NewConsumer and Consumer.Start instead.
-func StartConsumer(ctx context.Context, client *kgo.Client, handler func(*kgo.Record) error, opts ...ConsumerOptions) error {
-	c := NewConsumer(client, opts...)
-	return c.Start(ctx, handler)
-}
-
-// StartConsumerWithDLQ is a convenience function to start a consumer with DLQ support.
-//
-// Deprecated: Use NewConsumer with ConsumerOptions.DLQProducer instead.
-func StartConsumerWithDLQ(ctx context.Context, client *kgo.Client, handler func(*kgo.Record) error, dlqProducer Producer) error {
-	return StartConsumer(ctx, client, handler, ConsumerOptions{
-		DLQProducer: dlqProducer,
-		MaxRetries:  3,
-	})
+// recordContext returns ctx enriched with the span that tracing hooks (kotel)
+// stored on r, so work done by the handler is parented to the record's trace.
+// Cancellation and deadlines still come from ctx alone.
+func recordContext(ctx context.Context, r *kgo.Record) context.Context {
+	if r.Context == nil {
+		return ctx
+	}
+	if span := trace.SpanFromContext(r.Context); span.SpanContext().IsValid() {
+		return trace.ContextWithSpan(ctx, span)
+	}
+	return ctx
 }

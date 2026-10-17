@@ -1,0 +1,37 @@
+# Targets shared by every module Makefile (`include ../Makefile.common`).
+# Run them from the module directory, or from the repo root with `make lint`.
+
+# A bare `make` in a module runs its tests, not the first target below.
+.DEFAULT_GOAL := test
+
+# govulncheck is run from source at a pinned version so nothing has to be installed
+# and CI results do not drift; bump the version deliberately. Override with
+# GOVULNCHECK=govulncheck to use a local binary.
+GOVULNCHECK ?= go run golang.org/x/vuln/cmd/govulncheck@v1.9.0
+
+.PHONY: tidy vet test-race lint vuln check
+
+# go.mod and go.sum must already be tidy.
+tidy:
+	go mod tidy -diff
+
+# Also vets the integration-tagged tests.
+vet:
+	go vet -tags integration ./...
+
+# Unit tests under the race detector; no Docker.
+test-race:
+	go test -race -count=1 ./...
+
+# Uses the .golangci.yml at the repo root (found in a parent directory).
+lint:
+	golangci-lint run ./...
+
+# Reports known vulnerabilities that the module's code actually reaches,
+# including test code and the integration-tagged tests.
+vuln:
+	$(GOVULNCHECK) -tags integration -test ./...
+
+# Everything CI checks that needs no Docker. The integration tests run
+# separately (`make test`).
+check: tidy vet test-race lint vuln

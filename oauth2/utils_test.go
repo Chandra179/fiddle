@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 func TestGenerateRandomString(t *testing.T) {
@@ -15,8 +14,7 @@ func TestGenerateRandomString(t *testing.T) {
 
 	for _, length := range lengths {
 		t.Run("length_"+string(rune(length)), func(t *testing.T) {
-			str, err := GenerateRandomString(length)
-			require.NoError(t, err)
+			str := GenerateRandomString(length)
 			assert.NotEmpty(t, str)
 
 			// Hex encoding doubles the length
@@ -34,16 +32,14 @@ func TestGenerateRandomString_Unique(t *testing.T) {
 	// Generate multiple strings and ensure they're unique
 	generated := make(map[string]bool)
 	for range 100 {
-		str, err := GenerateRandomString(32)
-		require.NoError(t, err)
+		str := GenerateRandomString(32)
 		assert.False(t, generated[str], "Generated strings should be unique")
 		generated[str] = true
 	}
 }
 
 func TestGenerateCodeVerifier(t *testing.T) {
-	verifier, err := GenerateCodeVerifier()
-	require.NoError(t, err)
+	verifier := GenerateCodeVerifier()
 	assert.NotEmpty(t, verifier)
 
 	// PKCE code verifier must be 43-128 characters (base64url encoded)
@@ -64,16 +60,14 @@ func TestGenerateCodeVerifier(t *testing.T) {
 func TestGenerateCodeVerifier_Unique(t *testing.T) {
 	generated := make(map[string]bool)
 	for range 100 {
-		verifier, err := GenerateCodeVerifier()
-		require.NoError(t, err)
+		verifier := GenerateCodeVerifier()
 		assert.False(t, generated[verifier], "Code verifiers should be unique")
 		generated[verifier] = true
 	}
 }
 
 func TestGenerateCodeChallenge(t *testing.T) {
-	verifier, err := GenerateCodeVerifier()
-	require.NoError(t, err)
+	verifier := GenerateCodeVerifier()
 
 	challenge := GenerateCodeChallenge(verifier)
 	assert.NotEmpty(t, challenge)
@@ -94,8 +88,8 @@ func TestGenerateCodeChallenge(t *testing.T) {
 }
 
 func TestGenerateCodeChallenge_DifferentVerifiers(t *testing.T) {
-	verifier1, _ := GenerateCodeVerifier()
-	verifier2, _ := GenerateCodeVerifier()
+	verifier1 := GenerateCodeVerifier()
+	verifier2 := GenerateCodeVerifier()
 
 	challenge1 := GenerateCodeChallenge(verifier1)
 	challenge2 := GenerateCodeChallenge(verifier2)
@@ -104,8 +98,7 @@ func TestGenerateCodeChallenge_DifferentVerifiers(t *testing.T) {
 }
 
 func TestGenerateCodeChallenge_MatchesS256(t *testing.T) {
-	verifier, err := GenerateCodeVerifier()
-	require.NoError(t, err)
+	verifier := GenerateCodeVerifier()
 
 	// RFC 7636 S256: BASE64URL-ENCODE(SHA256(ASCII(code_verifier)))
 	sum := sha256.Sum256([]byte(verifier))
@@ -114,8 +107,7 @@ func TestGenerateCodeChallenge_MatchesS256(t *testing.T) {
 
 func TestPKCE_Verification(t *testing.T) {
 	// Simulate complete PKCE flow
-	verifier, err := GenerateCodeVerifier()
-	require.NoError(t, err)
+	verifier := GenerateCodeVerifier()
 
 	challenge := GenerateCodeChallenge(verifier)
 

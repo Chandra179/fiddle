@@ -39,7 +39,8 @@ func TestAppLogger_ProductionDropsDebug(t *testing.T) {
 
 func TestAppLogger_LoggerReturnsSameInstance(t *testing.T) {
 	l := NewLogger("development")
-	if l.Logger() != l.Logger() {
+	first := l.Logger()
+	if first != l.Logger() {
 		t.Fatal("Logger() must return a stable *slog.Logger")
 	}
 }

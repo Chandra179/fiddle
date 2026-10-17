@@ -7,19 +7,17 @@ import (
 	"golang.org/x/oauth2"
 )
 
-// GenerateRandomString generates a cryptographically secure random string
-func GenerateRandomString(length int) (string, error) {
-	bytes := make([]byte, length)
-	if _, err := rand.Read(bytes); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(bytes), nil
+// GenerateRandomString returns length cryptographically secure random bytes,
+// hex-encoded (so the result is 2*length characters long).
+func GenerateRandomString(length int) string {
+	b := make([]byte, length)
+	_, _ = rand.Read(b) // never fails since Go 1.24
+	return hex.EncodeToString(b)
 }
 
 // GenerateCodeVerifier generates a PKCE code verifier (43 characters, RFC 7636).
-// The error is always nil; it is kept for API compatibility.
-func GenerateCodeVerifier() (string, error) {
-	return oauth2.GenerateVerifier(), nil
+func GenerateCodeVerifier() string {
+	return oauth2.GenerateVerifier()
 }
 
 // GenerateCodeChallenge generates a PKCE code challenge from verifier using S256 method

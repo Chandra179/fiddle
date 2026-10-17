@@ -11,6 +11,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// hasState reports whether state is currently held, without consuming it.
+func hasState(s *InMemoryStorage, state string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, ok := s.data[state]
+	return ok
+}
+
 func TestNewInMemoryStorage(t *testing.T) {
 	storage := NewInMemoryStorage()
 	require.NotNil(t, storage)
@@ -30,77 +38,11 @@ func TestInMemoryStorage_SaveState(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verify state was saved
-	data, err := storage.GetStateData("test-state")
+	data, err := storage.ConsumeState("test-state")
 	require.NoError(t, err)
 	assert.Equal(t, "test-nonce", data.Nonce)
 	assert.Equal(t, "test-verifier", data.CodeVerifier)
 	assert.Equal(t, expiresAt.Unix(), data.ExpiresAt.Unix())
-}
-
-func TestInMemoryStorage_GetStateData_NotFound(t *testing.T) {
-	storage := NewInMemoryStorage()
-	defer storage.Cleanup()
-
-	_, err := storage.GetStateData("nonexistent-state")
-	assert.ErrorIs(t, err, ErrStateNotFound)
-}
-
-func TestInMemoryStorage_GetStateData_Expired(t *testing.T) {
-	storage := NewInMemoryStorage()
-	defer storage.Cleanup()
-
-	// Save expired state
-	expiresAt := time.Now().Add(-1 * time.Second)
-	err := storage.SaveState("expired-state", "nonce", "verifier", expiresAt)
-	require.NoError(t, err)
-
-	// Should return ErrStateExpired and delete the state
-	_, err = storage.GetStateData("expired-state")
-	assert.ErrorIs(t, err, ErrStateExpired)
-
-	// Verify state was deleted
-	_, err = storage.GetStateData("expired-state")
-	assert.ErrorIs(t, err, ErrStateNotFound)
-}
-
-func TestInMemoryStorage_GetStateData_Valid(t *testing.T) {
-	storage := NewInMemoryStorage()
-	defer storage.Cleanup()
-
-	expiresAt := time.Now().Add(5 * time.Minute)
-	err := storage.SaveState("valid-state", "nonce-123", "verifier-456", expiresAt)
-	require.NoError(t, err)
-
-	data, err := storage.GetStateData("valid-state")
-	require.NoError(t, err)
-	assert.Equal(t, "nonce-123", data.Nonce)
-	assert.Equal(t, "verifier-456", data.CodeVerifier)
-}
-
-func TestInMemoryStorage_DeleteState(t *testing.T) {
-	storage := NewInMemoryStorage()
-	defer storage.Cleanup()
-
-	// Save and then delete
-	expiresAt := time.Now().Add(5 * time.Minute)
-	err := storage.SaveState("delete-me", "nonce", "verifier", expiresAt)
-	require.NoError(t, err)
-
-	err = storage.DeleteState("delete-me")
-	require.NoError(t, err)
-
-	// Verify deletion
-	_, err = storage.GetStateData("delete-me")
-	assert.ErrorIs(t, err, ErrStateNotFound)
-}
-
-func TestInMemoryStorage_DeleteState_Nonexistent(t *testing.T) {
-	storage := NewInMemoryStorage()
-	defer storage.Cleanup()
-
-	// Should not error when deleting non-existent state
-	err := storage.DeleteState("nonexistent")
-	assert.NoError(t, err)
 }
 
 func TestInMemoryStorage_ConcurrentAccess(t *testing.T) {
@@ -129,7 +71,7 @@ func TestInMemoryStorage_ConcurrentAccess(t *testing.T) {
 		go func(idx int) {
 			defer wg.Done()
 			state := "state-" + string(rune(idx))
-			_, _ = storage.GetStateData(state)
+			_, _ = storage.ConsumeState(state)
 		}(i)
 	}
 	wg.Wait()
@@ -169,16 +111,12 @@ func TestInMemoryStorage_CleanupRoutine(t *testing.T) {
 
 	// Verify expired states are gone
 	for i := range 5 {
-		state := "expired-" + string(rune(i))
-		_, err := storage.GetStateData(state)
-		assert.ErrorIs(t, err, ErrStateNotFound)
+		assert.False(t, hasState(storage, "expired-"+string(rune(i))))
 	}
 
 	// Verify valid states still exist
 	for i := range 5 {
-		state := "valid-" + string(rune(i))
-		_, err := storage.GetStateData(state)
-		assert.NoError(t, err)
+		assert.True(t, hasState(storage, "valid-"+string(rune(i))))
 	}
 
 	storage.Cleanup()
@@ -287,10 +225,8 @@ func TestInMemoryStorage_MaxEntries_PurgesExpired(t *testing.T) {
 	// Full, but the expired entry is purged to make room
 	require.NoError(t, storage.SaveState("new", "n", "v", time.Now().Add(5*time.Minute)))
 
-	_, err := storage.GetStateData("expired")
-	assert.ErrorIs(t, err, ErrStateNotFound)
-	_, err = storage.GetStateData("new")
-	assert.NoError(t, err)
+	assert.False(t, hasState(storage, "expired"))
+	assert.True(t, hasState(storage, "new"))
 }
 
 func TestNewInMemoryStorageWithMaxEntries_Default(t *testing.T) {

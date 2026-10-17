@@ -1,6 +1,7 @@
 package cryptoutil
 
 import (
+	"cmp"
 	"crypto/subtle"
 	"fmt"
 
@@ -20,19 +21,15 @@ type scrypter struct {
 // Returns ErrInvalidParams if N is not a power of two > 1, r*p >= 2^30,
 // or KeyLen < 16.
 func NewScrypter(cfg ScryptConfig) (Scrypter, error) {
+	return newScrypter(cfg)
+}
+
+func newScrypter(cfg ScryptConfig) (*scrypter, error) {
 	def := DefaultScryptConfig()
-	if cfg.N == 0 {
-		cfg.N = def.N
-	}
-	if cfg.R == 0 {
-		cfg.R = def.R
-	}
-	if cfg.P == 0 {
-		cfg.P = def.P
-	}
-	if cfg.KeyLen == 0 {
-		cfg.KeyLen = def.KeyLen
-	}
+	cfg.N = cmp.Or(cfg.N, def.N)
+	cfg.R = cmp.Or(cfg.R, def.R)
+	cfg.P = cmp.Or(cfg.P, def.P)
+	cfg.KeyLen = cmp.Or(cfg.KeyLen, def.KeyLen)
 
 	if cfg.N <= 1 || cfg.N&(cfg.N-1) != 0 {
 		return nil, fmt.Errorf("%w: N must be a power of two > 1", ErrInvalidParams)

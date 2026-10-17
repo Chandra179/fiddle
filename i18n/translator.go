@@ -110,13 +110,12 @@ func (t *translator) getLocalizer(locale string) (*gotext.Localizer, error) {
 	}
 
 	// Create the localizer with the matched language AND the fallback language
-	var newLoc *gotext.Localizer
+	langs := []string{key}
 	if t.fallbackLocale != "" && t.fallbackLocale != key {
-		newLoc = gotext.NewLocalizer(t.bundle, key, t.fallbackLocale)
-	} else {
-		newLoc = gotext.NewLocalizer(t.bundle, key)
+		langs = append(langs, t.fallbackLocale)
 	}
 
+	newLoc := gotext.NewLocalizer(t.bundle, langs...)
 	t.localizers[key] = newLoc
 	return newLoc, nil
 }
@@ -147,5 +146,5 @@ func (t *translator) T(_ context.Context, locale, messageID string, templateData
 }
 
 func (t *translator) Locales() []string {
-	return append([]string{}, t.locales...)
+	return slices.Clone(t.locales)
 }

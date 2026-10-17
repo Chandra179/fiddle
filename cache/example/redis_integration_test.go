@@ -18,8 +18,11 @@ import (
 	"github.com/testcontainers/testcontainers-go/modules/redis"
 )
 
-// sharedCache is populated once by TestMain and reused by every test.
-var sharedCache cache.Cache
+// sharedCache and sharedAddr are populated once by TestMain and reused by every test.
+var (
+	sharedCache cache.Cache
+	sharedAddr  string
+)
 
 // TestMain starts one Redis container for the whole suite, runs the tests,
 // then terminates the container.
@@ -37,9 +40,9 @@ func TestMain(m *testing.M) {
 	}
 
 	// ConnectionString returns "redis://host:port" — strip the scheme.
-	addr = addr[len("redis://"):]
+	sharedAddr = addr[len("redis://"):]
 
-	sharedCache = cache.NewRedisCache(addr)
+	sharedCache = cache.NewRedisCache(sharedAddr)
 
 	code := m.Run()
 
@@ -368,9 +371,9 @@ func TestGetOrSet_DistributedStampede(t *testing.T) {
 	ctx := context.Background()
 
 	// Two independent clients = two separate "services" talking to same Redis.
-	node1 := cache.NewRedisCache(sharedCache.(*cache.RedisCache).Addr())
-	node2 := cache.NewRedisCache(sharedCache.(*cache.RedisCache).Addr())
-	t.Cleanup(func() { node1.Close(); node2.Close() })
+	node1 := cache.NewRedisCache(sharedAddr)
+	node2 := cache.NewRedisCache(sharedAddr)
+	t.Cleanup(func() { _ = node1.Close(); _ = node2.Close() })
 	t.Cleanup(func() {
 		_ = sharedCache.Del(ctx, "dist-stampede")
 		_ = sharedCache.Del(ctx, "dist-stampede:lock")
@@ -408,9 +411,9 @@ func TestGetOrSet_DistributedStampede(t *testing.T) {
 // Waiters spin-wait up to ~500ms, lock expires, fall through to fn.
 func TestGetOrSet_LockHolderCrash(t *testing.T) {
 	ctx := context.Background()
-	node1 := cache.NewRedisCache(sharedCache.(*cache.RedisCache).Addr())
-	node2 := cache.NewRedisCache(sharedCache.(*cache.RedisCache).Addr())
-	t.Cleanup(func() { node1.Close(); node2.Close() })
+	node1 := cache.NewRedisCache(sharedAddr)
+	node2 := cache.NewRedisCache(sharedAddr)
+	t.Cleanup(func() { _ = node1.Close(); _ = node2.Close() })
 	t.Cleanup(func() {
 		_ = sharedCache.Del(ctx, "crash-key")
 		_ = sharedCache.Del(ctx, "crash-key:lock")

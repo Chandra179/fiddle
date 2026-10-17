@@ -50,32 +50,29 @@ func mockCallbackHandler(info *CallbackInfo, err error) CallbackHandler {
 }
 
 func TestNewManager_MissingCallbackHandler(t *testing.T) {
-	ctx := context.Background()
 	config := &ManagerConfig{
 		CallbackHandler: nil,
 	}
 
-	_, err := NewManager(ctx, config)
+	_, err := NewManager(config)
 	assert.ErrorIs(t, err, ErrCallbackHandler)
 	assert.Contains(t, err.Error(), "callback handler is required")
 }
 
 func TestNewManager_Success(t *testing.T) {
-	ctx := context.Background()
 	config := &ManagerConfig{
 		CallbackHandler: mockCallbackHandler(&CallbackInfo{}, nil),
 		StateTimeout:    5 * time.Minute,
 	}
 
-	mgr, err := NewManager(ctx, config)
+	mgr, err := NewManager(config)
 	require.NoError(t, err)
 	assert.NotNil(t, mgr)
 }
 
 func TestNewManager_DefaultConfig(t *testing.T) {
-	ctx := context.Background()
 
-	mgr, err := NewManager(ctx, &ManagerConfig{
+	mgr, err := NewManager(&ManagerConfig{
 		CallbackHandler: mockCallbackHandler(&CallbackInfo{}, nil),
 	})
 	require.NoError(t, err)
@@ -84,12 +81,11 @@ func TestNewManager_DefaultConfig(t *testing.T) {
 }
 
 func TestManager_RegisterProvider(t *testing.T) {
-	ctx := context.Background()
 	config := &ManagerConfig{
 		CallbackHandler: mockCallbackHandler(&CallbackInfo{}, nil),
 	}
 
-	manager, err := NewManager(ctx, config)
+	manager, err := NewManager(config)
 	require.NoError(t, err)
 
 	mockProvider := &MockProvider{name: "test-provider", authURL: "https://example.com/auth"}
@@ -101,12 +97,11 @@ func TestManager_RegisterProvider(t *testing.T) {
 }
 
 func TestManager_RegisterProvider_Concurrent(t *testing.T) {
-	ctx := context.Background()
 	config := &ManagerConfig{
 		CallbackHandler: mockCallbackHandler(&CallbackInfo{}, nil),
 	}
 
-	mgr, err := NewManager(ctx, config)
+	mgr, err := NewManager(config)
 	require.NoError(t, err)
 
 	// Register providers concurrently
@@ -132,57 +127,53 @@ func TestManager_RegisterProvider_Concurrent(t *testing.T) {
 }
 
 func TestManager_GetProvider_NotFound(t *testing.T) {
-	ctx := context.Background()
 	config := &ManagerConfig{
 		CallbackHandler: mockCallbackHandler(&CallbackInfo{}, nil),
 	}
 
-	manager, err := NewManager(ctx, config)
+	manager, err := NewManager(config)
 	require.NoError(t, err)
 
 	_, err = manager.GetProvider("nonexistent")
 	assert.ErrorIs(t, err, ErrProviderNotFound)
 }
 
-func TestManager_GetAuthURL_Success(t *testing.T) {
-	ctx := context.Background()
+func TestManager_GetAuthURLWithState_Success(t *testing.T) {
 	config := &ManagerConfig{
 		CallbackHandler: mockCallbackHandler(&CallbackInfo{}, nil),
 		StateTimeout:    5 * time.Minute,
 	}
 
-	manager, err := NewManager(ctx, config)
+	manager, err := NewManager(config)
 	require.NoError(t, err)
 
 	mockProvider := &MockProvider{name: "test-provider", authURL: "https://example.com/auth"}
 	manager.RegisterProvider(mockProvider)
 
-	authURL, err := manager.GetAuthURL("test-provider")
+	authURL, _, err := manager.GetAuthURLWithState("test-provider")
 	require.NoError(t, err)
 	assert.Contains(t, authURL, "https://example.com/auth")
 	assert.Contains(t, authURL, "state=")
 }
 
-func TestManager_GetAuthURL_ProviderNotFound(t *testing.T) {
-	ctx := context.Background()
+func TestManager_GetAuthURLWithState_ProviderNotFound(t *testing.T) {
 	config := &ManagerConfig{
 		CallbackHandler: mockCallbackHandler(&CallbackInfo{}, nil),
 	}
 
-	manager, err := NewManager(ctx, config)
+	manager, err := NewManager(config)
 	require.NoError(t, err)
 
-	_, err = manager.GetAuthURL("nonexistent")
+	_, _, err = manager.GetAuthURLWithState("nonexistent")
 	assert.ErrorIs(t, err, ErrProviderNotFound)
 }
 
-func TestManager_GetAuthURL_GeneratesUniqueStates(t *testing.T) {
-	ctx := context.Background()
+func TestManager_GetAuthURLWithState_GeneratesUniqueStates(t *testing.T) {
 	config := &ManagerConfig{
 		CallbackHandler: mockCallbackHandler(&CallbackInfo{}, nil),
 	}
 
-	manager, err := NewManager(ctx, config)
+	manager, err := NewManager(config)
 	require.NoError(t, err)
 
 	mockProvider := &MockProvider{name: "test-provider", authURL: "https://example.com/auth"}
@@ -191,7 +182,7 @@ func TestManager_GetAuthURL_GeneratesUniqueStates(t *testing.T) {
 	// Generate multiple auth URLs
 	states := make(map[string]bool)
 	for range 10 {
-		authURL, err := manager.GetAuthURL("test-provider")
+		authURL, _, err := manager.GetAuthURLWithState("test-provider")
 		require.NoError(t, err)
 
 		// Extract state from URL
@@ -218,14 +209,14 @@ func TestManager_HandleCallback_Success(t *testing.T) {
 		StateTimeout:    5 * time.Minute,
 	}
 
-	manager, err := NewManager(ctx, config)
+	manager, err := NewManager(config)
 	require.NoError(t, err)
 
 	mockProvider := &MockProvider{name: "test-provider"}
 	manager.RegisterProvider(mockProvider)
 
 	// First generate an auth URL to create state
-	authURL, err := manager.GetAuthURL("test-provider")
+	authURL, _, err := manager.GetAuthURLWithState("test-provider")
 	require.NoError(t, err)
 	state := extractStateFromURL(authURL)
 
@@ -245,7 +236,7 @@ func TestManager_HandleCallback_InvalidState(t *testing.T) {
 		CallbackHandler: mockCallbackHandler(&CallbackInfo{}, nil),
 	}
 
-	manager, err := NewManager(ctx, config)
+	manager, err := NewManager(config)
 	require.NoError(t, err)
 
 	mockProvider := &MockProvider{name: "test-provider"}
@@ -262,14 +253,14 @@ func TestManager_HandleCallback_ExpiredState(t *testing.T) {
 		StateTimeout:    1 * time.Millisecond, // Very short timeout
 	}
 
-	manager, err := NewManager(ctx, config)
+	manager, err := NewManager(config)
 	require.NoError(t, err)
 
 	mockProvider := &MockProvider{name: "test-provider"}
 	manager.RegisterProvider(mockProvider)
 
 	// Generate auth URL
-	authURL, err := manager.GetAuthURL("test-provider")
+	authURL, _, err := manager.GetAuthURLWithState("test-provider")
 	require.NoError(t, err)
 	state := extractStateFromURL(authURL)
 
@@ -287,7 +278,7 @@ func TestManager_HandleCallback_ProviderNotFound(t *testing.T) {
 		CallbackHandler: mockCallbackHandler(&CallbackInfo{}, nil),
 	}
 
-	manager, err := NewManager(ctx, config)
+	manager, err := NewManager(config)
 	require.NoError(t, err)
 
 	_, err = manager.HandleCallback(ctx, "nonexistent", "code", "state")
@@ -302,13 +293,13 @@ func TestManager_HandleCallback_CallbackHandlerError(t *testing.T) {
 		StateTimeout:    5 * time.Minute, // Long timeout to prevent expiration
 	}
 
-	manager, err := NewManager(ctx, config)
+	manager, err := NewManager(config)
 	require.NoError(t, err)
 
 	mockProvider := &MockProvider{name: "test-provider"}
 	manager.RegisterProvider(mockProvider)
 
-	authURL, err := manager.GetAuthURL("test-provider")
+	authURL, _, err := manager.GetAuthURLWithState("test-provider")
 	require.NoError(t, err)
 	state := extractStateFromURL(authURL)
 
@@ -323,7 +314,7 @@ func TestManager_HandleCallback_ProviderError(t *testing.T) {
 		StateTimeout:    5 * time.Minute, // Long timeout to prevent expiration
 	}
 
-	manager, err := NewManager(ctx, config)
+	manager, err := NewManager(config)
 	require.NoError(t, err)
 
 	mockProvider := &MockProvider{
@@ -334,7 +325,7 @@ func TestManager_HandleCallback_ProviderError(t *testing.T) {
 	}
 	manager.RegisterProvider(mockProvider)
 
-	authURL, err := manager.GetAuthURL("test-provider")
+	authURL, _, err := manager.GetAuthURLWithState("test-provider")
 	require.NoError(t, err)
 	state := extractStateFromURL(authURL)
 
@@ -343,12 +334,11 @@ func TestManager_HandleCallback_ProviderError(t *testing.T) {
 }
 
 func TestManager_Cleanup(t *testing.T) {
-	ctx := context.Background()
 	config := &ManagerConfig{
 		CallbackHandler: mockCallbackHandler(&CallbackInfo{}, nil),
 	}
 
-	manager, err := NewManager(ctx, config)
+	manager, err := NewManager(config)
 	require.NoError(t, err)
 
 	assert.NotPanics(t, func() {
@@ -373,7 +363,7 @@ func extractStateFromURL(url string) string {
 }
 
 func TestManager_GetAuthURLWithState(t *testing.T) {
-	manager, err := NewManager(context.Background(), &ManagerConfig{
+	manager, err := NewManager(&ManagerConfig{
 		CallbackHandler: mockCallbackHandler(&CallbackInfo{}, nil),
 	})
 	require.NoError(t, err)
@@ -389,8 +379,8 @@ func TestManager_GetAuthURLWithState(t *testing.T) {
 	assert.ErrorIs(t, err, ErrProviderNotFound)
 }
 
-func TestManager_GetAuthURL_StateStoreFull(t *testing.T) {
-	manager, err := NewManager(context.Background(), &ManagerConfig{
+func TestManager_GetAuthURLWithState_StateStoreFull(t *testing.T) {
+	manager, err := NewManager(&ManagerConfig{
 		CallbackHandler: mockCallbackHandler(&CallbackInfo{}, nil),
 		MaxStateEntries: 2,
 	})
@@ -399,16 +389,16 @@ func TestManager_GetAuthURL_StateStoreFull(t *testing.T) {
 	manager.RegisterProvider(&MockProvider{name: "test-provider", authURL: "https://example.com/auth"})
 
 	for range 2 {
-		_, err := manager.GetAuthURL("test-provider")
+		_, _, err := manager.GetAuthURLWithState("test-provider")
 		require.NoError(t, err)
 	}
-	_, err = manager.GetAuthURL("test-provider")
+	_, _, err = manager.GetAuthURLWithState("test-provider")
 	assert.ErrorIs(t, err, ErrStateStoreFull)
 }
 
 func TestManager_HandleCallback_ConcurrentReplayExactlyOneWins(t *testing.T) {
 	ctx := context.Background()
-	manager, err := NewManager(ctx, &ManagerConfig{
+	manager, err := NewManager(&ManagerConfig{
 		CallbackHandler: mockCallbackHandler(&CallbackInfo{UserID: "u"}, nil),
 	})
 	require.NoError(t, err)
@@ -444,7 +434,7 @@ func TestManager_HandleCallback_ConcurrentReplayExactlyOneWins(t *testing.T) {
 func TestManager_HandleCallback_ProviderErrorIsUnwrappable(t *testing.T) {
 	ctx := context.Background()
 	providerErr := errors.New("provider error")
-	manager, err := NewManager(ctx, &ManagerConfig{
+	manager, err := NewManager(&ManagerConfig{
 		CallbackHandler: mockCallbackHandler(&CallbackInfo{}, nil),
 	})
 	require.NoError(t, err)
@@ -466,4 +456,23 @@ func TestManager_HandleCallback_ProviderErrorIsUnwrappable(t *testing.T) {
 	// A failed callback still consumes the state
 	_, err = manager.HandleCallback(ctx, "test-provider", "code", state)
 	assert.ErrorIs(t, err, ErrInvalidState)
+}
+
+func TestNewManager_DoesNotModifyConfig(t *testing.T) {
+	cfg := &ManagerConfig{CallbackHandler: mockCallbackHandler(&CallbackInfo{}, nil)}
+
+	m, err := NewManager(cfg)
+	require.NoError(t, err)
+	t.Cleanup(m.Cleanup)
+
+	assert.Zero(t, cfg.StateTimeout, "NewManager must not write defaults into the caller's config")
+	assert.Equal(t, DefaultManagerConfig().StateTimeout, m.(*manager).stateTimeout, "a zero StateTimeout uses the default")
+}
+
+func TestNewManager_RequiresCallbackHandler(t *testing.T) {
+	_, err := NewManager(nil)
+	assert.ErrorIs(t, err, ErrCallbackHandler)
+
+	_, err = NewManager(&ManagerConfig{})
+	assert.ErrorIs(t, err, ErrCallbackHandler)
 }

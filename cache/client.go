@@ -6,10 +6,8 @@ import (
 	"time"
 )
 
-var (
-	ErrCacheMiss    = errors.New("cache miss")
-	ErrCacheTimeout = errors.New("cache operation timeout")
-)
+// ErrCacheMiss is returned by Cache.Get when the key does not exist.
+var ErrCacheMiss = errors.New("cache miss")
 
 // IsCacheMiss reports whether err represents a cache miss.
 // Use instead of comparing to redis.Nil directly.

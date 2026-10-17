@@ -10,6 +10,7 @@ import (
 	"log"
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -206,7 +207,7 @@ func TestConsumerBasic(t *testing.T) {
 	var consumed []TestMessage
 	var mu sync.Mutex
 
-	handler := func(r *kgo.Record) error {
+	handler := func(_ context.Context, r *kgo.Record) error {
 		var msg TestMessage
 		if err := json.Unmarshal(r.Value, &msg); err != nil {
 			return err
@@ -222,7 +223,7 @@ func TestConsumerBasic(t *testing.T) {
 
 	consumer := kafka.NewConsumer(consumerClient)
 	go func() {
-		if err := consumer.Start(ctx, handler); err != nil && err != context.Canceled {
+		if err := consumer.Start(ctx, handler); err != nil && !errors.Is(err, context.Canceled) {
 			t.Logf("consumer error: %v", err)
 		}
 	}()
@@ -258,7 +259,7 @@ func TestProducerConsumerFlow(t *testing.T) {
 	var receivedCount int
 	var mu sync.Mutex
 
-	handler := func(r *kgo.Record) error {
+	handler := func(_ context.Context, r *kgo.Record) error {
 		var msg TestMessage
 		if err := json.Unmarshal(r.Value, &msg); err != nil {
 			return err
@@ -321,13 +322,13 @@ func TestConsumerWithDLQ(t *testing.T) {
 	var dlqCount int
 	var mu sync.Mutex
 
-	handler := func(r *kgo.Record) error {
+	handler := func(_ context.Context, r *kgo.Record) error {
 		var msg TestMessage
 		if err := json.Unmarshal(r.Value, &msg); err != nil {
 			return err
 		}
 		if msg.Content == "fail" {
-			return fmt.Errorf("intentional failure for testing")
+			return errors.New("intentional failure for testing")
 		}
 		return nil
 	}
@@ -393,7 +394,7 @@ func TestConsumerStopsWhenDLQFails(t *testing.T) {
 	var handled []string
 	var mu sync.Mutex
 
-	handler := func(r *kgo.Record) error {
+	handler := func(_ context.Context, r *kgo.Record) error {
 		var msg TestMessage
 		if err := json.Unmarshal(r.Value, &msg); err != nil {
 			return err
@@ -521,4 +522,77 @@ func TestConfig(t *testing.T) {
 		err := cfg.Validate()
 		assert.NoError(t, err)
 	})
+}
+
+// SendToDLQ writes the dlq_error header through the formatter: the error type
+// by default (never the message), the truncated message on request, anything
+// else via a custom formatter, and no header at all for "".
+func TestSendToDLQ_ErrorHeader(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	cases := []struct {
+		name       string
+		topic      string
+		opts       []kafka.ProducerOption
+		err        error
+		want       string
+		wantHeader bool
+	}{
+		{"default writes the error type, never the message", "test-dlq-hdr-default", nil, fmt.Errorf("handling: %w", errors.New("password=hunter2")), "*errors.errorString", true},
+		{"a class set with WithDLQClass is the whole header", "test-dlq-hdr-class", nil, kafka.WithDLQClass(errors.New("password=hunter2"), "db_timeout"), "db_timeout", true},
+		{
+			"DLQErrorMessage keeps a short error", "test-dlq-hdr-message",
+			[]kafka.ProducerOption{kafka.WithDLQErrorFormatter(kafka.DLQErrorMessage)},
+			errors.New("boom"), "boom", true,
+		},
+		{
+			"DLQErrorMessage truncates a long error", "test-dlq-hdr-long",
+			[]kafka.ProducerOption{kafka.WithDLQErrorFormatter(kafka.DLQErrorMessage)},
+			errors.New(strings.Repeat("x", 2000)), strings.Repeat("x", 512), true,
+		},
+		{
+			"formatter redacts", "test-dlq-hdr-redact",
+			[]kafka.ProducerOption{kafka.WithDLQErrorFormatter(func(error) string { return "redacted" })},
+			errors.New("password=hunter2"), "redacted", true,
+		},
+		{
+			"empty formatter output omits the header", "test-dlq-hdr-omit",
+			[]kafka.ProducerOption{kafka.WithDLQErrorFormatter(func(error) string { return "" })},
+			errors.New("secret"), "", false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dlqTopic := tc.topic + ".dlq"
+			ensureTopicExists(t, dlqTopic)
+
+			producer := kafka.NewProducer(sharedClient, tc.opts...)
+			require.NoError(t, producer.SendToDLQ(ctx, tc.topic, []byte(`{"id":"1"}`), []byte("k"), tc.err))
+
+			reader, err := kgo.NewClient(
+				kgo.SeedBrokers(sharedBrokers...),
+				kgo.ConsumeTopics(dlqTopic),
+				kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+			)
+			require.NoError(t, err)
+			t.Cleanup(reader.Close)
+
+			fetches := reader.PollFetches(ctx)
+			require.NoError(t, fetches.Err())
+			records := fetches.Records()
+			require.Len(t, records, 1)
+
+			headers := map[string]string{}
+			for _, h := range records[0].Headers {
+				headers[h.Key] = string(h.Value)
+			}
+			assert.Equal(t, tc.topic, headers["origin_topic"])
+			assert.Contains(t, headers, "dlq_timestamp")
+			got, ok := headers["dlq_error"]
+			assert.Equal(t, tc.wantHeader, ok)
+			assert.Equal(t, tc.want, got)
+		})
+	}
 }

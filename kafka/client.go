@@ -1,8 +1,8 @@
 package kafka
 
 import (
+	"cmp"
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -14,12 +14,9 @@ import (
 	"github.com/twmb/franz-go/plugin/kotel"
 )
 
-// Sentinel errors for the kafka package.
-var (
-	ErrProducerClosed = errors.New("kafka: producer is closed")
-	ErrConsumerClosed = errors.New("kafka: consumer is closed")
-	ErrDLQPublish     = errors.New("kafka: failed to publish to DLQ")
-)
+// ErrDLQPublish is returned (wrapped) by Consumer.Start when a failed record
+// could not be published to the dead letter topic.
+var ErrDLQPublish = errors.New("kafka: failed to publish to DLQ")
 
 // Producer produces messages to Kafka topics.
 // Produce and SendMessage are asynchronous; SendToDLQ blocks until the broker
@@ -30,10 +27,23 @@ type Producer interface {
 	SendToDLQ(ctx context.Context, originalTopic string, value []byte, key []byte, dlqErr error) error
 }
 
+// Handler processes one consumed record.
+//
+// ctx is cancelled when the context given to Consumer.Start is, so a handler
+// that blocks (HTTP call, database query) can stop promptly on shutdown. When
+// the client was created with Config.EnableOTel, ctx also carries the span of
+// the record's receive operation, so spans started from it join the producer's
+// trace.
+//
+// A non-nil error is retried (see ConsumerOptions.MaxRetries) and then sent to
+// the DLQ. The error text is published in the DLQ record's dlq_error header,
+// see WithDLQErrorFormatter.
+type Handler func(ctx context.Context, record *kgo.Record) error
+
 // Consumer consumes messages from Kafka topics.
 // Start blocks until the context is cancelled, the client is closed, or a fatal error occurs.
 type Consumer interface {
-	Start(ctx context.Context, handler func(*kgo.Record) error) error
+	Start(ctx context.Context, handler Handler) error
 }
 
 // HealthChecker provides health check functionality for Kafka.
@@ -43,18 +53,7 @@ type HealthChecker interface {
 	LivenessCheck(ctx context.Context) error
 }
 
-// NewKafkaClient creates a Kafka client with the provided configuration.
-//
-// Deprecated: Use NewKafkaClientFromConfig for production use.
-func NewKafkaClient(slogInstance *slog.Logger, brokers []string, topics []string, groupID string) (*kgo.Client, error) {
-	cfg := DefaultConfig(brokers, groupID).
-		WithTopics(topics...).
-		WithLogger(slogInstance)
-	return NewKafkaClientFromConfig(context.Background(), cfg)
-}
-
 // NewKafkaClientFromConfig creates a Kafka client from a Config struct.
-// This is the recommended way to create clients in production.
 //
 // When cfg.GroupID is set the client is created with kgo.BlockRebalanceOnPoll:
 // callers that poll the client directly must call AllowRebalance after handling
@@ -64,85 +63,35 @@ func NewKafkaClientFromConfig(ctx context.Context, cfg *Config) (*kgo.Client, er
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
 
-	logger := cfg.Logger
-	if logger == nil {
-		logger = slog.Default()
-	}
-
 	opts := []kgo.Opt{
 		kgo.SeedBrokers(cfg.Brokers...),
-
-		// Producer settings
-		kgo.RecordRetries(cfg.RecordRetries),
-		kgo.RequestRetries(cfg.RequestRetries),
-		kgo.RetryBackoffFn(func(tries int) time.Duration {
-			return time.Duration(tries) * 100 * time.Millisecond
-		}),
-		kgo.ProducerBatchCompression(kgo.SnappyCompression()),
-		kgo.ProducerBatchMaxBytes(cfg.BatchMaxBytes),
-		kgo.ProducerLinger(cfg.LingerDuration),
 
 		// Connection settings
 		kgo.RequestTimeoutOverhead(cfg.RequestTimeoutOverhead),
 		kgo.ConnIdleTimeout(cfg.ConnIdleTimeout),
 
 		// Observability
-		kgo.WithLogger(&SlogShim{L: logger}),
+		kgo.WithLogger(&SlogShim{L: cmp.Or(cfg.Logger, slog.Default())}),
 	}
-
-	// Set required acks
-	switch cfg.RequiredAcks {
-	case NoAck:
-		opts = append(opts, kgo.RequiredAcks(kgo.NoAck()))
-	case LeaderAck:
-		opts = append(opts, kgo.RequiredAcks(kgo.LeaderAck()))
-	default:
-		opts = append(opts, kgo.RequiredAcks(kgo.AllISRAcks()))
-	}
+	opts = append(opts, producerOpts(cfg)...)
 
 	// Consumer settings (only if GroupID is set)
 	if cfg.GroupID != "" {
-		opts = append(opts,
-			kgo.ConsumerGroup(cfg.GroupID),
-			kgo.ConsumeResetOffset(kgo.NewOffset().AtEnd()),
-			kgo.DisableAutoCommit(),
-			kgo.FetchMaxWait(cfg.FetchMaxWait),
-			kgo.FetchMinBytes(cfg.FetchMinBytes),
-			kgo.FetchMaxBytes(cfg.FetchMaxBytes),
-			kgo.SessionTimeout(cfg.SessionTimeout),
-			kgo.HeartbeatInterval(cfg.HeartbeatInterval),
-			kgo.RebalanceTimeout(cfg.RebalanceTimeout),
-			kgo.BlockRebalanceOnPoll(),
-		)
+		opts = append(opts, consumerOpts(cfg)...)
 	}
-
-	// Topics to consume
 	if len(cfg.Topics) > 0 {
 		opts = append(opts, kgo.ConsumeTopics(cfg.Topics...))
 	}
 
-	// TLS configuration
-	if cfg.TLSEnabled {
-		tlsConfig := cfg.TLSConfig
-		if tlsConfig == nil {
-			tlsConfig = &tls.Config{MinVersion: tls.VersionTLS12}
-		}
-		opts = append(opts, kgo.DialTLSConfig(tlsConfig))
+	securityOpts, err := securityOpts(cfg)
+	if err != nil {
+		return nil, err
 	}
-
-	// SASL authentication
-	if cfg.SASLMechanism != "" {
-		saslOpt, err := buildSASLOpt(cfg)
-		if err != nil {
-			return nil, fmt.Errorf("failed to configure SASL: %w", err)
-		}
-		opts = append(opts, saslOpt)
-	}
+	opts = append(opts, securityOpts...)
 
 	// OpenTelemetry hooks
 	if cfg.EnableOTel {
-		k := kotel.NewKotel()
-		opts = append(opts, kgo.WithHooks(k.Hooks()...))
+		opts = append(opts, kgo.WithHooks(kotel.NewKotel().Hooks()...))
 	}
 
 	client, err := kgo.NewClient(opts...)
@@ -157,6 +106,61 @@ func NewKafkaClientFromConfig(ctx context.Context, cfg *Config) (*kgo.Client, er
 	}
 
 	return client, nil
+}
+
+// producerOpts returns the producer settings of cfg.
+func producerOpts(cfg *Config) []kgo.Opt {
+	acks := kgo.AllISRAcks()
+	switch cfg.RequiredAcks {
+	case NoAck:
+		acks = kgo.NoAck()
+	case LeaderAck:
+		acks = kgo.LeaderAck()
+	}
+
+	return []kgo.Opt{
+		kgo.RequiredAcks(acks),
+		kgo.RecordRetries(cfg.RecordRetries),
+		kgo.RequestRetries(cfg.RequestRetries),
+		kgo.RetryBackoffFn(func(tries int) time.Duration {
+			return time.Duration(tries) * 100 * time.Millisecond
+		}),
+		kgo.ProducerBatchCompression(kgo.SnappyCompression()),
+		kgo.ProducerBatchMaxBytes(cfg.BatchMaxBytes),
+		kgo.ProducerLinger(cfg.LingerDuration),
+	}
+}
+
+// consumerOpts returns the consumer-group settings of cfg.
+func consumerOpts(cfg *Config) []kgo.Opt {
+	return []kgo.Opt{
+		kgo.ConsumerGroup(cfg.GroupID),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtEnd()),
+		kgo.DisableAutoCommit(),
+		kgo.FetchMaxWait(cfg.FetchMaxWait),
+		kgo.FetchMinBytes(cfg.FetchMinBytes),
+		kgo.FetchMaxBytes(cfg.FetchMaxBytes),
+		kgo.SessionTimeout(cfg.SessionTimeout),
+		kgo.HeartbeatInterval(cfg.HeartbeatInterval),
+		kgo.RebalanceTimeout(cfg.RebalanceTimeout),
+		kgo.BlockRebalanceOnPoll(),
+	}
+}
+
+// securityOpts returns the TLS and SASL settings of cfg.
+func securityOpts(cfg *Config) ([]kgo.Opt, error) {
+	var opts []kgo.Opt
+	if cfg.TLSEnabled {
+		opts = append(opts, kgo.DialTLSConfig(cmp.Or(cfg.TLSConfig, defaultTLSConfig())))
+	}
+	if cfg.SASLMechanism != "" {
+		saslOpt, err := buildSASLOpt(cfg)
+		if err != nil {
+			return nil, fmt.Errorf("failed to configure SASL: %w", err)
+		}
+		opts = append(opts, saslOpt)
+	}
+	return opts, nil
 }
 
 func buildSASLOpt(cfg *Config) (kgo.Opt, error) {
@@ -188,12 +192,32 @@ func buildSASLOpt(cfg *Config) (kgo.Opt, error) {
 }
 
 // SlogShim adapts *slog.Logger to the kgo.Logger interface.
+//
+// franz-go logs from client background goroutines (heartbeats, metadata
+// refreshes, reconnects) that belong to no caller's request, and kgo.Logger
+// carries no context, so records are logged with context.Background().
 type SlogShim struct {
 	L *slog.Logger
 }
 
+// Level reports the most verbose level the underlying logger has enabled, so
+// franz-go debug logs appear when (and only when) the slog handler accepts
+// debug records. It is evaluated on every call, so it follows a slog.LevelVar
+// that changes at runtime.
 func (s *SlogShim) Level() kgo.LogLevel {
-	return kgo.LogLevelInfo
+	ctx := context.Background()
+	switch {
+	case s.L.Enabled(ctx, slog.LevelDebug):
+		return kgo.LogLevelDebug
+	case s.L.Enabled(ctx, slog.LevelInfo):
+		return kgo.LogLevelInfo
+	case s.L.Enabled(ctx, slog.LevelWarn):
+		return kgo.LogLevelWarn
+	case s.L.Enabled(ctx, slog.LevelError):
+		return kgo.LogLevelError
+	default:
+		return kgo.LogLevelNone
+	}
 }
 
 func (s *SlogShim) Log(level kgo.LogLevel, msg string, keyvals ...any) {

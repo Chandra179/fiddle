@@ -83,14 +83,21 @@ type TopologyCache struct {
 }
 
 // NewClient creates a new RabbitMQ client with auto-reconnection.
+//
+// Unset fields are filled with Config.ApplyDefaults and the result is checked
+// with Config.Validate. The client works on a copy, so config is neither
+// modified nor read again after NewClient returns.
 func NewClient(config *Config, logger *slog.Logger) (*Client, error) {
 	if config == nil {
-		return nil, fmt.Errorf("rabbitmq: config nil")
+		return nil, errors.New("rabbitmq: config nil")
 	}
 
-	if err := config.ApplyDefaults(); err != nil {
+	cfg := *config
+	cfg.ApplyDefaults()
+	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("rabbitmq: %w", err)
 	}
+	config = &cfg
 
 	if logger == nil {
 		logger = slog.Default()
@@ -171,6 +178,18 @@ func (c *Client) connect() error {
 		_ = pubConn.Close()
 		_ = consConn.Close()
 		return fmt.Errorf("channel pool initialization failed: %w", err)
+	}
+
+	// Re-declare the topology before the client reports StateConnected, so
+	// anything waiting on IsHealthy (such as a consumer re-subscribing) finds
+	// its queues. A failure fails this attempt and is retried with backoff.
+	if err := c.restoreTopology(); err != nil {
+		_ = pubConn.Close()
+		_ = consConn.Close()
+		if c.closing() {
+			return ErrClientClosed
+		}
+		return fmt.Errorf("topology restore failed: %w", err)
 	}
 
 	go c.handleConnectionClose(pubConn, "publisher")
@@ -294,38 +313,25 @@ func (c *Client) handleConnectionBlocked(conn *amqp.Connection, connType string)
 			if !ok {
 				return
 			}
-			if blocking.Active {
-				c.logger.Warn("rabbitmq connection blocked",
-					"connection_type", connType,
-					"reason", blocking.Reason,
-				)
-			} else {
+			if !blocking.Active {
 				c.logger.Info("rabbitmq connection unblocked",
 					"connection_type", connType,
 				)
+				continue
 			}
+			c.logger.Warn("rabbitmq connection blocked",
+				"connection_type", connType,
+				"reason", blocking.Reason,
+			)
 		}
 	}
 }
 
-// triggerReconnect initiates reconnection if not already connecting or closing.
+// triggerReconnect starts a reconnect when the client is connected. In any
+// other state a reconnect is already running or the client is closing.
 func (c *Client) triggerReconnect() {
-	for {
-		currentState := c.state.Load()
-		switch ConnectionState(currentState) {
-		case StateConnected:
-			if c.state.CompareAndSwap(int32(StateConnected), int32(StateConnecting)) {
-				go c.reconnectWithBackoff()
-				return
-			}
-		case StateConnecting, StateClosing:
-			return
-		case StateDisconnected:
-			if c.state.CompareAndSwap(int32(StateDisconnected), int32(StateConnecting)) {
-				go c.reconnectWithBackoff()
-				return
-			}
-		}
+	if c.state.CompareAndSwap(int32(StateConnected), int32(StateConnecting)) {
+		go c.reconnectWithBackoff()
 	}
 }
 
@@ -352,10 +358,6 @@ func (c *Client) reconnectWithBackoff() {
 				c.logger.Error("reconnection attempt failed", "error", err, "next_backoff", backoff)
 				timer.Reset(jitter(backoff))
 				continue
-			}
-
-			if err := c.restoreTopology(); err != nil {
-				c.logger.Error("failed to restore topology", "error", err)
 			}
 
 			c.logger.Info("reconnection successful")
@@ -390,14 +392,25 @@ func (c *Client) ReturnPublisherChannel(ch *amqp.Channel) {
 }
 
 // CreateConsumerChannel creates a new channel on the consumer connection.
+// It returns ErrNotConnected unless the client is StateConnected.
 func (c *Client) CreateConsumerChannel() (*amqp.Channel, error) {
 	if c.state.Load() != int32(StateConnected) {
 		return nil, ErrNotConnected
 	}
+	return c.openConsumerChannel()
+}
 
+// openConsumerChannel opens a channel on the current consumer connection
+// whatever the client state. connect uses it to restore topology while the
+// client is still StateConnecting.
+func (c *Client) openConsumerChannel() (*amqp.Channel, error) {
 	c.mu.RLock()
 	conn := c.consumerConn
 	c.mu.RUnlock()
+
+	if conn == nil || conn.IsClosed() {
+		return nil, ErrNotConnected
+	}
 
 	ch, err := conn.Channel()
 	if err != nil {

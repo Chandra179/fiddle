@@ -1,6 +1,7 @@
 package rabbitmq
 
 import (
+	"cmp"
 	"crypto/tls"
 	"errors"
 	"math"
@@ -28,8 +29,10 @@ const (
 	DefaultPrefetchCount       = 10
 	DefaultReconnectInitialSec = 1
 	DefaultReconnectMaxSec     = 60
-	DefaultRetryTTLSec         = 30
 	DefaultMaxRetries          = 3
+	// DefaultRetryBackoff is the base delay between retries when RetryEnabled
+	// is false; it doubles with every retry, up to maxRetryDelay.
+	DefaultRetryBackoff = time.Second
 )
 
 // Config holds RabbitMQ configuration
@@ -52,24 +55,43 @@ type Config struct {
 	AutoAck       bool // Should always be false in production
 
 	// Queue settings
-	QueueType  QueueType
-	Durable    bool
-	AutoDelete bool
-	Exclusive  bool
-	NoWait     bool
+	//
+	// QueueType decides whether durable queues declared through the
+	// TopologyManager are quorum queues. Other queue properties (durability,
+	// auto-delete, ...) are set per queue in QueueConfig.
+	QueueType QueueType
 
 	// Retry/DLX settings.
 	//
 	// RetryEnabled: a failed delivery is rejected without requeue so it flows
 	// through the queue's dead-letter exchange into the TTL retry queue (see
-	// TopologyManager.SetupDeadLetterExchange / SetupQueueWithDLX). Without a
-	// DLX on the queue, rejected messages are dropped. When false, failed
-	// deliveries are requeued immediately.
+	// TopologyManager.SetupDeadLetterExchange / SetupQueueWithDLX), which delays
+	// the retry by the TTL passed to SetupDeadLetterExchange. Without a DLX on
+	// the queue, rejected messages are dropped.
+	//
+	// When false, the client waits RetryBackoff (doubling with every retry),
+	// then republishes the failed delivery to the same queue with an
+	// incremented "x-retry-count" header and acks the original. It counts the
+	// attempts itself, so the loop is bounded by MaxRetries on classic and
+	// quorum queues alike (a plain requeue would only be bounded on quorum
+	// queues, by the broker's delivery limit). The copy goes to the back of the
+	// queue. The wait happens in the consume loop, so it also slows the
+	// consumer down while a dependency keeps failing, which is intended
+	// backpressure. The republish and the ack are two steps: if the ack is lost
+	// the message is delivered twice, as with any at-least-once consumer.
+	//
+	// RetryBackoff is the base delay of that wait. Zero uses
+	// DefaultRetryBackoff; a negative value retries at once. It is ignored when
+	// RetryEnabled is true, where the retry queue's TTL is the delay.
+	//
+	// MaxRetries is the number of retries after the first failure. Zero uses
+	// DefaultMaxRetries; a negative value means no retries: a failed message
+	// goes straight to the parking lot (or is rejected).
 	//
 	// DeadLetterEnabled: once MaxRetries is reached the message is published
 	// to "<queue>.parking-lot" and acked. When false it is rejected instead.
 	RetryEnabled      bool
-	RetryTTL          time.Duration
+	RetryBackoff      time.Duration
 	MaxRetries        int
 	DeadLetterEnabled bool
 
@@ -98,12 +120,8 @@ func NewDefaultConfig() *Config {
 		PrefetchCount:            DefaultPrefetchCount,
 		AutoAck:                  false,
 		QueueType:                QueueTypeQuorum,
-		Durable:                  true,
-		AutoDelete:               false,
-		Exclusive:                false,
-		NoWait:                   false,
 		RetryEnabled:             false,
-		RetryTTL:                 DefaultRetryTTLSec * time.Second,
+		RetryBackoff:             DefaultRetryBackoff,
 		MaxRetries:               DefaultMaxRetries,
 		DeadLetterEnabled:        false,
 		ReconnectInitialInterval: DefaultReconnectInitialSec * time.Second,
@@ -111,10 +129,32 @@ func NewDefaultConfig() *Config {
 	}
 }
 
-// ApplyDefaults validates required config fields.
-// Returns an error if any required field is not set.
-// Note: All fields are required - values must be loaded from the YAML configuration.
-func (c *Config) ApplyDefaults() error {
+// ApplyDefaults sets every zero-valued field that has a default in
+// NewDefaultConfig: ConnectionName, ChannelPoolSize, PrefetchCount, QueueType,
+// RetryBackoff, MaxRetries, ReconnectInitialInterval and ReconnectMaxInterval.
+// For RetryBackoff and MaxRetries an explicit negative value is kept and means
+// "none" (see Config); for the other fields a negative value is left alone so
+// Validate rejects it. Because zero means "unset", an explicit zero cannot be
+// expressed: MaxRetries: 0 becomes DefaultMaxRetries.
+//
+// Boolean fields cannot be told apart from unset ones and are never touched;
+// start from NewDefaultConfig to get its boolean defaults. URL has no default.
+func (c *Config) ApplyDefaults() {
+	def := NewDefaultConfig()
+
+	c.ConnectionName = cmp.Or(c.ConnectionName, def.ConnectionName)
+	c.ChannelPoolSize = cmp.Or(c.ChannelPoolSize, def.ChannelPoolSize)
+	c.PrefetchCount = cmp.Or(c.PrefetchCount, def.PrefetchCount)
+	c.QueueType = cmp.Or(c.QueueType, def.QueueType)
+	c.RetryBackoff = cmp.Or(c.RetryBackoff, def.RetryBackoff)
+	c.MaxRetries = cmp.Or(c.MaxRetries, def.MaxRetries)
+	c.ReconnectInitialInterval = cmp.Or(c.ReconnectInitialInterval, def.ReconnectInitialInterval)
+	c.ReconnectMaxInterval = cmp.Or(c.ReconnectMaxInterval, def.ReconnectMaxInterval)
+}
+
+// Validate reports the first invalid field. It does not modify the config; call
+// ApplyDefaults first to fill unset fields (NewClient does both).
+func (c *Config) Validate() error {
 	if c.URL == "" {
 		return ErrURLRequired
 	}
@@ -124,31 +164,23 @@ func (c *Config) ApplyDefaults() error {
 	}
 
 	if c.ChannelPoolSize <= 0 {
-		return errors.New("rabbitmq: channel pool size is required")
+		return errors.New("rabbitmq: channel pool size must be positive")
 	}
 
 	if c.PrefetchCount <= 0 {
-		return errors.New("rabbitmq: prefetch count is required")
+		return errors.New("rabbitmq: prefetch count must be positive")
 	}
 
 	if c.QueueType == "" {
 		return errors.New("rabbitmq: queue type is required")
 	}
 
-	if c.RetryTTL <= 0 {
-		return errors.New("rabbitmq: retry TTL is required")
-	}
-
-	if c.MaxRetries <= 0 {
-		return errors.New("rabbitmq: max retries is required")
-	}
-
 	if c.ReconnectInitialInterval <= 0 {
-		return errors.New("rabbitmq: reconnect initial interval is required")
+		return errors.New("rabbitmq: reconnect initial interval must be positive")
 	}
 
 	if c.ReconnectMaxInterval <= 0 {
-		return errors.New("rabbitmq: reconnect max interval is required")
+		return errors.New("rabbitmq: reconnect max interval must be positive")
 	}
 
 	if c.ChannelMax < 0 || c.ChannelMax > math.MaxUint16 {

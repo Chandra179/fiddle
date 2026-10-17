@@ -12,7 +12,7 @@ This is a utility project for Golang. Each module lives in its own subdirectory 
        ├── go.sum
        ├── yourmodule.go             # public API / interfaces
        ├── impl.go                   # implementation(s)
-       ├── Makefile                  # at minimum: a `test` target
+       ├── Makefile                  # at minimum: a `test` target; include ../Makefile.common for lint/vuln
        └── example/
            └── integration_test.go  # integration tests using testcontainers or similar
    ```
@@ -28,11 +28,16 @@ This is a utility project for Golang. Each module lives in its own subdirectory 
 
 4. **Implementation file** — implement the interfaces declared in the API file. Unexported types are fine; expose only constructors (e.g. `NewXxxClient`).
 
-5. **`Makefile`** — include at least an integration test target:
+5. **`Makefile`** — include at least an integration test target, and the shared `lint` and `vuln` targets:
    ```makefile
+   .PHONY: test
+
+   include ../Makefile.common
+
    test:
    	go test -tags integration -v -count=1 -timeout 300s ./...
    ```
+   Put the `//go:build integration` tag on every test file that needs Docker (or any other external service), so that a plain `go test ./...` runs only the unit tests. Add the module to `MODULES` in the root `Makefile` and to the matrices in `.github/workflows/ci.yml`.
 
 6. **`example/` integration tests** — use `TestMain` to spin up any required infrastructure (e.g. a Testcontainers container) once for the whole suite, then share the connection across tests to keep suite startup time flat:
    ```go
@@ -54,8 +59,8 @@ The `db/` module is the canonical reference implementation. It provides a Postgr
 | File | Purpose |
 |------|---------|
 | `db/client.go` | Sentinel errors, `DBTX`, `SQLExecutor`, `DB` interfaces, `ConnectionConfig` |
-| `db/postgres.go` | `NewPostgresClient` constructor and `postgresClient` implementation |
-| `db/Makefile` | `test` target running integration tests with `-tags integration` |
+| `db/postgres.go` | `NewPostgresClient` constructor and `postgresClient` implementation (pgx through `database/sql`) |
+| `db/Makefile` | `test` target running integration tests with `-tags integration`, plus `test-unit`, `lint` and `vuln` |
 | `db/example/postgres_integration_test.go` | Full integration test suite using Testcontainers |
 
 ### Interface hierarchy
@@ -73,11 +78,14 @@ Pass `DBTX` or `SQLExecutor` to repositories so they can't accidentally close th
 ```go
 import "db"
 
-client, err := db.NewPostgresClient(dsn, db.ConnectionConfig{
+// ctx cancels the startup ping, which is also bounded by PingTimeout (default 5s).
+client, err := db.NewPostgresClient(ctx, dsn, db.ConnectionConfig{
     MaxOpenConns:    10,
     MaxIdleConns:    5,
     ConnMaxLifetime: 30 * time.Minute,
-    QueryTimeout:    5 * time.Second,
+    QueryTimeout:    5 * time.Second,  // per query
+    TxTimeout:       30 * time.Second, // per WithTransaction call, begin to commit
+    PingTimeout:     3 * time.Second,
 })
 if err != nil {
     log.Fatal(err)
@@ -98,6 +106,27 @@ err = client.WithTransaction(ctx, sql.LevelReadCommitted, func(ctx context.Conte
 if db.IsDuplicateKeyError(err) { ... }
 if db.IsTimeoutError(err)      { ... }
 ```
+
+### Driver notes
+
+The driver is pgx through `database/sql`.
+
+- **PgBouncer (transaction pooling) and similar proxies.** pgx prepares and caches statements per connection by default, which such a proxy cannot serve. Add `default_query_exec_mode=exec` (or `cache_describe`, `simple_protocol`) to the DSN. The `db` integration tests check that these modes create no named prepared statements.
+- **Column types.** `json`, `jsonb`, `uuid`, `numeric` (scale kept, e.g. `"12.50"`), `timestamptz`, `bytea`, `bool` and `bigint` scan into `[]byte`/`string`, `string`, `time.Time`, `[]byte`, `bool` and `int64` as usual (see `TestScan_CommonColumnTypes`). Array columns are not covered: use a driver-specific helper for them.
+
+## Development
+
+Run from the repo root to cover every module, or `make <target>` inside one module:
+
+```bash
+make test-unit   # tests that need no Docker
+make test        # everything; the integration tests need Docker
+make lint        # golangci-lint, configured by .golangci.yml
+make vuln        # govulncheck
+make check       # tidy, vet, race tests, lint and vuln: what CI checks without Docker
+```
+
+CI (`.github/workflows/ci.yml`) runs the same targets per module, plus the integration tests.
 
 ## Prompt
 see proven implementation from big companies, do we need abstraction? is it general implementation? do the implementation handle specific usecase only or general? is it configurable or not? document it in architecture decision record in adr.md in the directory if not exist create one.

@@ -1,11 +1,23 @@
 package kafka
 
 import (
+	"cmp"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"log/slog"
+	"slices"
 	"time"
 )
+
+// saslMechanisms are the supported Config.SASLMechanism values.
+var saslMechanisms = []string{"PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512"}
+
+// defaultTLSConfig is used when TLS is enabled without an explicit config: TLS
+// 1.2 or newer with the system roots.
+func defaultTLSConfig() *tls.Config {
+	return &tls.Config{MinVersion: tls.VersionTLS12}
+}
 
 // Config holds all configuration for Kafka client.
 type Config struct {
@@ -13,7 +25,10 @@ type Config struct {
 	Brokers []string
 	Topics  []string
 	GroupID string
-	Logger  *slog.Logger
+	// Logger receives the client's own logs. franz-go's verbosity follows the
+	// levels this logger enables: use a handler at slog.LevelDebug to see
+	// franz-go debug logs.
+	Logger *slog.Logger
 
 	// Security - TLS
 	TLSEnabled bool
@@ -109,13 +124,7 @@ func (c *Config) WithLogger(logger *slog.Logger) *Config {
 // If tlsConfig is nil, a default TLS config will be used.
 func (c *Config) WithTLS(tlsConfig *tls.Config) *Config {
 	c.TLSEnabled = true
-	if tlsConfig != nil {
-		c.TLSConfig = tlsConfig
-	} else {
-		c.TLSConfig = &tls.Config{
-			MinVersion: tls.VersionTLS12,
-		}
-	}
+	c.TLSConfig = cmp.Or(tlsConfig, defaultTLSConfig())
 	return c
 }
 
@@ -142,21 +151,8 @@ func (c *Config) Validate() error {
 		return errors.New("kafka: at least one broker is required")
 	}
 
-	if c.SASLMechanism != "" {
-		if c.SASLUsername == "" || c.SASLPassword == "" {
-			return errors.New("kafka: SASL username and password are required when SASL is enabled")
-		}
-		validMechanisms := map[string]bool{
-			"PLAIN":         true,
-			"SCRAM-SHA-256": true,
-			"SCRAM-SHA-512": true,
-		}
-		if !validMechanisms[c.SASLMechanism] {
-			return errors.New("kafka: unsupported SASL mechanism: " + c.SASLMechanism)
-		}
-		if c.SASLMechanism == "PLAIN" && !c.TLSEnabled && !c.AllowPlaintextSASL {
-			return errors.New("kafka: SASL PLAIN requires TLS; enable TLS or set AllowPlaintextSASL")
-		}
+	if err := c.validateSASL(); err != nil {
+		return err
 	}
 
 	if c.RecordRetries < 0 {
@@ -175,5 +171,22 @@ func (c *Config) Validate() error {
 		return errors.New("kafka: fetch max bytes must be positive")
 	}
 
+	return nil
+}
+
+// validateSASL checks the SASL settings; it accepts a config without SASL.
+func (c *Config) validateSASL() error {
+	if c.SASLMechanism == "" {
+		return nil
+	}
+	if c.SASLUsername == "" || c.SASLPassword == "" {
+		return errors.New("kafka: SASL username and password are required when SASL is enabled")
+	}
+	if !slices.Contains(saslMechanisms, c.SASLMechanism) {
+		return fmt.Errorf("kafka: unsupported SASL mechanism: %s", c.SASLMechanism)
+	}
+	if c.SASLMechanism == "PLAIN" && !c.TLSEnabled && !c.AllowPlaintextSASL {
+		return errors.New("kafka: SASL PLAIN requires TLS; enable TLS or set AllowPlaintextSASL")
+	}
 	return nil
 }

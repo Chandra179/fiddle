@@ -1,6 +1,7 @@
 package rabbitmq
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -58,9 +59,7 @@ type PublishOptions struct {
 
 // PublishMessage publishes a message to the specified exchange/routing key.
 func (p *Producer) PublishMessage(ctx context.Context, opts PublishOptions, payload any) error {
-	ctx, span := p.tracer.Start(ctx, "rabbitmq.publish",
-		trace.WithAttributes(),
-	)
+	ctx, span := p.tracer.Start(ctx, "rabbitmq.publish")
 	defer span.End()
 
 	ch, err := p.acquireChannel(ctx)
@@ -124,9 +123,7 @@ func (p *Producer) publishOn(ctx context.Context, ch *amqp.Channel, opts Publish
 
 	// Prepare headers with OTel trace context
 	headers := amqp.Table{}
-	if opts.Headers != nil {
-		maps.Copy(headers, opts.Headers)
-	}
+	maps.Copy(headers, opts.Headers)
 
 	carrier := propagation.MapCarrier{}
 	otel.GetTextMapPropagator().Inject(ctx, carrier)
@@ -135,21 +132,17 @@ func (p *Producer) publishOn(ctx context.Context, ch *amqp.Channel, opts Publish
 	}
 
 	deliveryMode := amqp.Transient
-	if opts.DeliveryMode != 0 {
+	switch {
+	case opts.DeliveryMode != 0:
 		deliveryMode = opts.DeliveryMode
-	} else if p.client.config.PersistentDelivery {
+	case p.client.config.PersistentDelivery:
 		deliveryMode = amqp.Persistent
 	}
 
 	mandatory := p.client.config.Mandatory || opts.Mandatory
 
-	contentType := opts.ContentType
-	if contentType == "" {
-		contentType = "application/json"
-	}
-
 	publishing := amqp.Publishing{
-		ContentType:     contentType,
+		ContentType:     cmp.Or(opts.ContentType, "application/json"),
 		ContentEncoding: opts.ContentEncoding,
 		Body:            body,
 		DeliveryMode:    deliveryMode,

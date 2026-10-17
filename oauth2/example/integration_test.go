@@ -15,7 +15,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gin-gonic/gin"
 	"github.com/go-jose/go-jose/v4"
 	josejwt "github.com/go-jose/go-jose/v4/jwt"
 	"github.com/stretchr/testify/assert"
@@ -48,7 +47,7 @@ func (s *oidcServer) discovery(w http.ResponseWriter, r *http.Request) {
 		doc["end_session_endpoint"] = s.issuer() + "/end-session"
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(doc)
+	_ = json.NewEncoder(w).Encode(doc)
 }
 
 func (s *oidcServer) jwks(w http.ResponseWriter, r *http.Request) {
@@ -60,7 +59,7 @@ func (s *oidcServer) jwks(w http.ResponseWriter, r *http.Request) {
 	}
 	set := jose.JSONWebKeySet{Keys: []jose.JSONWebKey{jwk}}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(set)
+	_ = json.NewEncoder(w).Encode(set)
 }
 
 func (s *oidcServer) token(w http.ResponseWriter, r *http.Request) {
@@ -127,13 +126,13 @@ func (s *oidcServer) token(w http.ResponseWriter, r *http.Request) {
 		"id_token":      idToken,
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 // package-level variables shared across tests
 var (
 	mockOIDC *oidcServer
-	provider *oauth2pkg.GoogleOIDCProvider
+	provider *oauth2pkg.OIDCProvider
 	manager  oauth2pkg.Manager
 )
 
@@ -164,7 +163,7 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	manager, err = oauth2pkg.NewManager(ctx, &oauth2pkg.ManagerConfig{
+	manager, err = oauth2pkg.NewManager(&oauth2pkg.ManagerConfig{
 		StateTimeout: 5 * time.Minute,
 		CallbackHandler: func(ctx context.Context, providerName string, userInfo *oauth2pkg.UserInfo, tokenSet *oauth2pkg.TokenSet) (*oauth2pkg.CallbackInfo, error) {
 			return &oauth2pkg.CallbackInfo{
@@ -189,20 +188,24 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-func TestIntegration_GetAuthURL(t *testing.T) {
-	authURL, err := manager.GetAuthURL("google")
+func TestIntegration_GetAuthURLWithState(t *testing.T) {
+	authURL, _, err := manager.GetAuthURLWithState("google")
 	require.NoError(t, err)
 	assert.Contains(t, authURL, mockOIDC.issuer())
 	assert.Contains(t, authURL, "state=")
 	assert.Contains(t, authURL, "code_challenge=")
 	assert.Contains(t, authURL, "nonce=")
+	// A generic OIDC provider must not send Google-specific parameters or
+	// force the consent screen unless asked to.
+	assert.NotContains(t, authURL, "prompt=")
+	assert.NotContains(t, authURL, "access_type=")
 }
 
 func TestIntegration_FullFlow(t *testing.T) {
 	ctx := context.Background()
 
 	// Step 1: generate auth URL (creates state + nonce + PKCE in storage)
-	authURL, err := manager.GetAuthURL("google")
+	authURL, _, err := manager.GetAuthURLWithState("google")
 	require.NoError(t, err)
 
 	state := extractParam(authURL, "state")
@@ -231,7 +234,7 @@ func TestIntegration_InvalidState(t *testing.T) {
 }
 
 func TestIntegration_UnknownProvider(t *testing.T) {
-	_, err := manager.GetAuthURL("github")
+	_, _, err := manager.GetAuthURLWithState("github")
 	assert.ErrorIs(t, err, oauth2pkg.ErrProviderNotFound)
 }
 
@@ -239,9 +242,9 @@ func TestIntegration_ConcurrentAuthURLs(t *testing.T) {
 	const n = 10
 	results := make(chan string, n)
 
-	for i := 0; i < n; i++ {
+	for range n {
 		go func() {
-			url, err := manager.GetAuthURL("google")
+			url, _, err := manager.GetAuthURLWithState("google")
 			if err != nil {
 				results <- ""
 				return
@@ -251,7 +254,7 @@ func TestIntegration_ConcurrentAuthURLs(t *testing.T) {
 	}
 
 	seen := make(map[string]bool)
-	for i := 0; i < n; i++ {
+	for range n {
 		state := <-results
 		require.NotEmpty(t, state, "state should not be empty")
 		assert.False(t, seen[state], "state must be unique across concurrent requests")
@@ -274,10 +277,8 @@ func TestIntegration_EndSessionEndpoint_Fallback(t *testing.T) {
 }
 
 func TestIntegration_HTTPFlowWithStateCookie(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-
 	var gotUser *oauth2pkg.UserInfo
-	mgr, err := oauth2pkg.NewManager(context.Background(), &oauth2pkg.ManagerConfig{
+	mgr, err := oauth2pkg.NewManager(&oauth2pkg.ManagerConfig{
 		CallbackHandler: func(ctx context.Context, providerName string, userInfo *oauth2pkg.UserInfo, tokenSet *oauth2pkg.TokenSet) (*oauth2pkg.CallbackInfo, error) {
 			gotUser = userInfo
 			return &oauth2pkg.CallbackInfo{
@@ -292,9 +293,9 @@ func TestIntegration_HTTPFlowWithStateCookie(t *testing.T) {
 	t.Cleanup(mgr.Cleanup)
 	mgr.RegisterProvider(provider)
 
-	router := gin.New()
-	router.GET("/login", oauth2pkg.GoogleLoginHandler(mgr, nil))
-	router.GET("/callback", oauth2pkg.GoogleCallbackHandler(mgr, nil))
+	router := http.NewServeMux()
+	router.HandleFunc("GET /login", oauth2pkg.GoogleLoginHandler(mgr, nil))
+	router.HandleFunc("GET /callback", oauth2pkg.GoogleCallbackHandler(mgr, nil))
 
 	login := func(t *testing.T) (state, nonce string, stateCookie *http.Cookie) {
 		t.Helper()

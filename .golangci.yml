@@ -1,0 +1,29 @@
+# golangci-lint configuration shared by every module. Each module is its own Go
+# module, so run it from the module directory (golangci-lint finds this file in
+# a parent directory):
+#
+#   cd db && golangci-lint run --build-tags integration ./...
+#
+# The root Makefile does this for all modules: `make lint`.
+version: "2"
+
+run:
+  timeout: 5m
+  # Lint the integration tests (db/, kafka/, rabbitmq/, cache/example, ...) too.
+  build-tags:
+    - integration
+
+linters:
+  # standard: errcheck, govet, ineffassign, staticcheck, unused
+  default: standard
+  enable:
+    - errorlint # type assertions and comparisons on wrapped errors
+    - misspell
+    - unconvert
+    - bodyclose
+    - noctx
+
+issues:
+  # Report every finding instead of collapsing repeats.
+  max-issues-per-linter: 0
+  max-same-issues: 0

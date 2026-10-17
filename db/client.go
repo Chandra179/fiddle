@@ -7,13 +7,9 @@ import (
 	"time"
 )
 
-// ErrDatabaseTimeout is returned when a database operation times out.
-var ErrDatabaseTimeout = errors.New("database operation timed out")
-
-// ErrDuplicateKey is returned when a unique constraint is violated.
-var ErrDuplicateKey = errors.New("duplicate key violation")
-
-// ErrConnectionFailed is returned when database connection fails.
+// ErrConnectionFailed is returned (wrapped) by NewPostgresClient when the
+// connection cannot be opened or verified. Classify other failures with
+// IsTimeoutError, IsSerializationError and IsDuplicateKeyError.
 var ErrConnectionFailed = errors.New("database connection failed")
 
 // DBTX is the interface for database operations that both *sql.DB and *sql.Tx implement.
@@ -39,7 +35,10 @@ type SQLExecutor interface {
 	WithTransaction(ctx context.Context, isolationLevel sql.IsolationLevel, fn func(ctx context.Context, tx DBTX) error) error
 }
 
-// ConnectionConfig holds connection pool and query timeout configuration.
+// DefaultPingTimeout bounds the startup ping when ConnectionConfig.PingTimeout is unset.
+const DefaultPingTimeout = 5 * time.Second
+
+// ConnectionConfig holds connection pool, startup and timeout configuration.
 //
 // Zero values are ignored — the underlying sql.DB defaults are preserved for
 // any field left unset.
@@ -54,7 +53,20 @@ type ConnectionConfig struct {
 	ConnMaxIdleTime time.Duration
 	// QueryTimeout, when non-zero, is applied as a deadline to every query that
 	// does not already carry a shorter deadline via its context.
+	//
+	// It does not apply to statements run through the DBTX handed to a
+	// WithTransaction callback; those are bounded by TxTimeout.
 	QueryTimeout time.Duration
+	// TxTimeout, when non-zero, bounds a whole WithTransaction call (begin, the
+	// callback and commit) unless its context already carries a shorter
+	// deadline. When it fires the transaction is rolled back and the callback's
+	// context is cancelled. Set it larger than QueryTimeout: it covers many
+	// statements, not one.
+	TxTimeout time.Duration
+	// PingTimeout bounds the connectivity check done by the constructor.
+	// Zero uses DefaultPingTimeout. The check also stops when the context given
+	// to the constructor is done.
+	PingTimeout time.Duration
 }
 
 // DB is the top-level database handle returned by a driver constructor such as

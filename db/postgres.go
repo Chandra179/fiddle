@@ -6,13 +6,16 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"slices"
 	"strings"
 	"time"
 
-	"github.com/lib/pq"
+	"github.com/jackc/pgx/v5/pgconn"
+	_ "github.com/jackc/pgx/v5/stdlib" // registers the "pgx" database/sql driver
 )
 
-// postgresClient implements the DB interface for PostgreSQL using lib/pq.
+// postgresClient implements the DB interface for PostgreSQL using pgx through
+// its database/sql adapter.
 type postgresClient struct {
 	db     *sql.DB
 	config ConnectionConfig
@@ -22,10 +25,23 @@ type postgresClient struct {
 // and connection pool configuration. The connection is verified with a ping
 // before returning, so a non-nil return value is ready to use.
 //
+// The driver is pgx through database/sql. By default pgx prepares and caches
+// statements per connection, which a transaction-pooling proxy such as PgBouncer
+// cannot serve (a statement is prepared on one server connection and run on
+// another, failing with "prepared statement ... already exists" or "does not
+// exist"). Behind such a proxy add default_query_exec_mode=exec (or
+// cache_describe, simple_protocol) to the DSN, for example
+//
+//	postgres://user:pass@pgbouncer:6432/app?default_query_exec_mode=exec
+//
+// ctx cancels the startup ping, which is also bounded by
+// ConnectionConfig.PingTimeout (DefaultPingTimeout when unset). ctx is not
+// retained: it has no effect on the returned client after this call.
+//
 // The caller is responsible for calling Close() when the client is no longer
 // needed (typically at process shutdown).
-func NewPostgresClient(dsn string, config ConnectionConfig) (DB, error) {
-	db, err := sql.Open("postgres", dsn)
+func NewPostgresClient(ctx context.Context, dsn string, config ConnectionConfig) (DB, error) {
+	db, err := sql.Open("pgx", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrConnectionFailed, err)
 	}
@@ -45,10 +61,14 @@ func NewPostgresClient(dsn string, config ConnectionConfig) (DB, error) {
 	}
 
 	// Verify the connection before handing the client to the caller.
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	pingTimeout := config.PingTimeout
+	if pingTimeout <= 0 {
+		pingTimeout = DefaultPingTimeout
+	}
+	pingCtx, cancel := context.WithTimeout(ctx, pingTimeout)
 	defer cancel()
 
-	if err := db.PingContext(ctx); err != nil {
+	if err := db.PingContext(pingCtx); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("%w: %w", ErrConnectionFailed, err)
 	}
@@ -56,19 +76,22 @@ func NewPostgresClient(dsn string, config ConnectionConfig) (DB, error) {
 	return &postgresClient{db: db, config: config}, nil
 }
 
-// withQueryTimeout wraps ctx with QueryTimeout when the config has one set and
-// the context does not already carry a shorter deadline.
-func (c *postgresClient) withQueryTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
-	if c.config.QueryTimeout <= 0 {
+// withTimeout wraps ctx with d when d is positive and the context does not
+// already carry a shorter deadline.
+func withTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	if d <= 0 {
 		return ctx, func() {}
 	}
-	if deadline, ok := ctx.Deadline(); ok {
-		if time.Until(deadline) <= c.config.QueryTimeout {
-			// Caller's deadline is already tighter — don't override it.
-			return ctx, func() {}
-		}
+	// Caller's deadline is already tighter — don't override it.
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= d {
+		return ctx, func() {}
 	}
-	return context.WithTimeout(ctx, c.config.QueryTimeout)
+	return context.WithTimeout(ctx, d)
+}
+
+// withQueryTimeout applies QueryTimeout to ctx.
+func (c *postgresClient) withQueryTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	return withTimeout(ctx, c.config.QueryTimeout)
 }
 
 // ExecContext executes a query without returning any rows.
@@ -117,11 +140,20 @@ func (c *postgresClient) QueryRowContext(ctx context.Context, query string, args
 // any sqlc-generated query. The transaction is committed when fn returns nil
 // and rolled back otherwise. A panic inside fn triggers a rollback and is
 // re-raised after the rollback completes.
+//
+// TxTimeout, when set, bounds the whole call. The context passed to fn carries
+// that deadline; once it expires database/sql rolls the transaction back and
+// the error returned here satisfies IsTimeoutError.
 func (c *postgresClient) WithTransaction(
 	ctx context.Context,
 	isolationLevel sql.IsolationLevel,
 	fn func(ctx context.Context, tx DBTX) error,
 ) error {
+	// The context governs the transaction until it is committed or rolled
+	// back, so it is released only when this call returns.
+	ctx, cancel := withTimeout(ctx, c.config.TxTimeout)
+	defer cancel()
+
 	tx, err := c.db.BeginTx(ctx, &sql.TxOptions{Isolation: isolationLevel})
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
@@ -135,8 +167,12 @@ func (c *postgresClient) WithTransaction(
 	}()
 
 	if err := fn(ctx, tx); err != nil {
-		if rbErr := tx.Rollback(); rbErr != nil {
-			return fmt.Errorf("transaction failed: %v, rollback also failed: %w", err, rbErr)
+		// When ctx has ended, database/sql aborts the transaction itself and the
+		// driver drops the connection, so Rollback fails with ErrTxDone or a
+		// closed-connection error whatever happened: the server discards the
+		// transaction either way, and the original error is the one to report.
+		if rbErr := tx.Rollback(); rbErr != nil && ctx.Err() == nil && !errors.Is(rbErr, sql.ErrTxDone) {
+			return fmt.Errorf("transaction failed: %w, rollback also failed: %w", err, rbErr)
 		}
 		return err
 	}
@@ -161,9 +197,42 @@ func (c *postgresClient) PingContext(ctx context.Context) error {
 // ---- Error classification helpers ------------------------------------------
 //
 // These helpers are intentionally separate from the sentinel errors so callers
-// can decide how to handle driver-level errors without importing lib/pq
+// can decide how to handle driver-level errors without importing pgx
 // themselves. They fall back to string matching when the error is not a
-// *pq.Error (e.g. wrapped errors from pgx or other drivers).
+// *pgconn.PgError (e.g. errors from other drivers).
+
+// Driver-agnostic fallbacks: lower-case substrings of an error message.
+var (
+	timeoutKeywords = []string{
+		"timeout",
+		"deadline exceeded",
+		"connection timed out",
+		"query_canceled",
+		"57014",
+		"55p03",
+	}
+	serializationKeywords = []string{
+		"could not serialize access",
+		"deadlock detected",
+		"40001",
+		"40p01",
+	}
+	// "already exists" is deliberately absent: it also covers DDL errors such
+	// as 42P07 (duplicate_table).
+	duplicateKeyKeywords = []string{
+		"duplicate key",
+		"unique constraint",
+		"unique violation",
+		"23505",
+	}
+)
+
+// messageContainsAny reports whether the lower-cased message of err contains
+// any of keywords.
+func messageContainsAny(err error, keywords []string) bool {
+	msg := strings.ToLower(err.Error())
+	return slices.ContainsFunc(keywords, func(kw string) bool { return strings.Contains(msg, kw) })
+}
 
 // IsTimeoutError reports whether err represents a query, lock or connection timeout.
 //
@@ -186,9 +255,9 @@ func IsTimeoutError(err error) bool {
 		return true
 	}
 
-	// lib/pq fast path — checked first to avoid string allocation.
-	if pqErr, ok := errors.AsType[*pq.Error](err); ok {
-		switch pqErr.Code {
+	// pgx fast path — checked first to avoid string allocation.
+	if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok {
+		switch pgErr.Code {
 		case "57014", // query_canceled (statement_timeout, cancel request)
 			"55P03", // lock_not_available (lock_timeout)
 			"25P03", // idle_in_transaction_session_timeout
@@ -198,21 +267,8 @@ func IsTimeoutError(err error) bool {
 		return false
 	}
 
-	// Driver-agnostic fallback (covers pgx, wrapped errors, etc.).
-	msg := strings.ToLower(err.Error())
-	for _, kw := range []string{
-		"timeout",
-		"deadline exceeded",
-		"connection timed out",
-		"query_canceled",
-		"57014",
-		"55p03",
-	} {
-		if strings.Contains(msg, kw) {
-			return true
-		}
-	}
-	return false
+	// Driver-agnostic fallback (covers other drivers, wrapped errors, etc.).
+	return messageContainsAny(err, timeoutKeywords)
 }
 
 // IsSerializationError reports whether err is a transient transaction conflict
@@ -225,22 +281,11 @@ func IsSerializationError(err error) bool {
 		return false
 	}
 
-	if pqErr, ok := errors.AsType[*pq.Error](err); ok {
-		return pqErr.Code == "40001" || pqErr.Code == "40P01"
+	if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok {
+		return pgErr.Code == "40001" || pgErr.Code == "40P01"
 	}
 
-	msg := strings.ToLower(err.Error())
-	for _, kw := range []string{
-		"could not serialize access",
-		"deadlock detected",
-		"40001",
-		"40p01",
-	} {
-		if strings.Contains(msg, kw) {
-			return true
-		}
-	}
-	return false
+	return messageContainsAny(err, serializationKeywords)
 }
 
 // IsDuplicateKeyError reports whether err is a unique-constraint violation.
@@ -253,23 +298,11 @@ func IsDuplicateKeyError(err error) bool {
 		return false
 	}
 
-	// lib/pq fast path.
-	if pqErr, ok := errors.AsType[*pq.Error](err); ok {
-		return pqErr.Code == "23505" // unique_violation
+	// pgx fast path.
+	if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok {
+		return pgErr.Code == "23505" // unique_violation
 	}
 
-	// Driver-agnostic fallback. "already exists" is deliberately not matched:
-	// it also covers DDL errors such as 42P07 (duplicate_table).
-	msg := strings.ToLower(err.Error())
-	for _, kw := range []string{
-		"duplicate key",
-		"unique constraint",
-		"unique violation",
-		"23505",
-	} {
-		if strings.Contains(msg, kw) {
-			return true
-		}
-	}
-	return false
+	// Driver-agnostic fallback.
+	return messageContainsAny(err, duplicateKeyKeywords)
 }

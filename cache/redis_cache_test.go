@@ -13,13 +13,13 @@ import (
 )
 
 // setupTestRedis creates a miniredis server for testing
-func setupTestRedis(t *testing.T) (*miniredis.Miniredis, *RedisCache) {
+func setupTestRedis(t *testing.T) (*miniredis.Miniredis, *redisCache) {
 	t.Helper()
 
 	mr, err := miniredis.Run()
 	require.NoError(t, err, "failed to start miniredis")
 
-	cache := NewRedisCache(mr.Addr()).(*RedisCache)
+	cache := NewRedisCache(mr.Addr()).(*redisCache)
 
 	return mr, cache
 }
@@ -32,10 +32,10 @@ func TestNewRedisCache(t *testing.T) {
 	cache := NewRedisCache(mr.Addr())
 
 	assert.NotNil(t, cache)
-	assert.IsType(t, &RedisCache{}, cache)
+	assert.IsType(t, &redisCache{}, cache)
 
 	// Verify the cache is functional
-	redisCache := cache.(*RedisCache)
+	redisCache := cache.(*redisCache)
 	assert.NotNil(t, redisCache.client)
 }
 
@@ -254,8 +254,8 @@ func TestRedisCache_Ping(t *testing.T) {
 	})
 
 	t.Run("ping after close returns error", func(t *testing.T) {
-		cache2 := NewRedisCache(mr.Addr()).(*RedisCache)
-		cache2.Close()
+		cache2 := NewRedisCache(mr.Addr()).(*redisCache)
+		_ = cache2.Close()
 
 		err := cache2.Ping(ctx)
 		assert.Error(t, err)
@@ -268,7 +268,7 @@ func TestRedisCache_Close(t *testing.T) {
 		require.NoError(t, err)
 		defer mr.Close()
 
-		cache := NewRedisCache(mr.Addr()).(*RedisCache)
+		cache := NewRedisCache(mr.Addr()).(*redisCache)
 
 		err = cache.Close()
 		assert.NoError(t, err)
@@ -279,7 +279,7 @@ func TestRedisCache_Close(t *testing.T) {
 		require.NoError(t, err)
 		defer mr.Close()
 
-		cache := NewRedisCache(mr.Addr()).(*RedisCache)
+		cache := NewRedisCache(mr.Addr()).(*redisCache)
 
 		err = cache.Close()
 		assert.NoError(t, err)
@@ -494,7 +494,6 @@ func TestNewRedisCacheFromConfig(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, "cfg-value", val)
 		assert.False(t, mr.Exists("cfg-key"), "key must not land in DB 0")
-		assert.Equal(t, mr.Addr(), c.(*RedisCache).Addr())
 	})
 
 	t.Run("wrong password fails", func(t *testing.T) {

@@ -15,9 +15,15 @@ Each module is tested independently. Integration tests require Docker (testconta
 cd db/ && make test
 # Expands to: go test -tags integration -v -count=1 -timeout 300s ./...
 
-# Unit tests only (no Docker)
+# Unit tests only (no Docker): integration tests carry //go:build integration
 cd cache/ && go test -v -count=1 ./...
 cd logger/ && make test
+make test-unit            # from the repo root, every module that has integration tests
+
+# Lint (.golangci.yml at the root) and vulnerability scan
+cd db/ && make lint && make vuln
+make lint                 # from the repo root, every module
+make check                # tidy, vet, race tests, lint, vuln: what CI checks without Docker
 ```
 
 ## Architecture
@@ -28,7 +34,7 @@ Each module follows this pattern:
 - **`client.go`** (or `<module>.go`) — public API: sentinel errors, interfaces, config structs. Keep the surface small.
 - **`impl.go`** / named files — unexported struct implementing the interface; only constructors are exported (e.g. `NewPostgresClient`).
 - **`example/`** — integration tests with `TestMain` starting infrastructure once via testcontainers; per-test cleanup via `t.Cleanup`.
-- **Makefile** - add `go test -tags integration -v -count=1 -timeout 300s ./...`
+- **Makefile** - add `go test -tags integration -v -count=1 -timeout 300s ./...` and `include ../Makefile.common` (shared `lint` and `vuln` targets)
 
 ### Interface-first design
 

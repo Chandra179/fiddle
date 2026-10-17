@@ -1,6 +1,7 @@
 package oauth2
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -11,7 +12,6 @@ import (
 var (
 	ErrProviderNotFound = errors.New("provider not found")
 	ErrInvalidState     = errors.New("invalid state")
-	ErrOAuth2State      = errors.New("invalid oauth2 state")
 	ErrOAuth2Callback   = errors.New("oauth2 callback error")
 	ErrCallbackHandler  = errors.New("callback handler not set")
 )
@@ -57,38 +57,27 @@ type manager struct {
 	stateTimeout    time.Duration
 }
 
-// NewManager creates a new manager with providers from configuration
-func NewManager(ctx context.Context, cfg *ManagerConfig) (Manager, error) {
-	// Start with defaults
-	defaultCfg := DefaultManagerConfig()
-
-	if cfg == nil {
-		cfg = defaultCfg
-	}
-
-	// Apply defaults for unset fields
-	if cfg.StateTimeout == 0 {
-		cfg.StateTimeout = defaultCfg.StateTimeout
-	}
+// NewManager creates a new manager. A nil cfg or zero fields use
+// DefaultManagerConfig's values; cfg itself is not modified.
+func NewManager(cfg *ManagerConfig) (Manager, error) {
+	cfg = cmp.Or(cfg, DefaultManagerConfig())
 
 	// Validate required callback handler
 	if cfg.CallbackHandler == nil {
 		return nil, fmt.Errorf("%w: callback handler is required", ErrCallbackHandler)
 	}
 
-	mgr := &manager{
+	return &manager{
 		providers:       make(map[string]Provider),
 		stateStorage:    NewInMemoryStorageWithMaxEntries(cfg.MaxStateEntries),
 		callbackHandler: cfg.CallbackHandler,
-		stateTimeout:    cfg.StateTimeout,
-	}
-
-	return mgr, nil
+		stateTimeout:    cmp.Or(cfg.StateTimeout, DefaultManagerConfig().StateTimeout),
+	}, nil
 }
 
 // NewManagerWithGoogle creates a new manager with Google provider configured
 func NewManagerWithGoogle(ctx context.Context, cfg *ManagerConfig, googleClientID, googleClientSecret, googleRedirectURL string) (Manager, error) {
-	mgr, err := NewManager(ctx, cfg)
+	mgr, err := NewManager(cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -118,13 +107,6 @@ func (m *manager) RegisterProvider(provider Provider) {
 	m.providers[provider.GetName()] = provider
 }
 
-// GetAuthURL generates authorization URL with state, nonce, and PKCE
-// This method is safe for concurrent use
-func (m *manager) GetAuthURL(providerName string) (string, error) {
-	authURL, _, err := m.GetAuthURLWithState(providerName)
-	return authURL, err
-}
-
 // GetAuthURLWithState generates authorization URL with state, nonce, and PKCE,
 // and also returns the state so the caller can bind it to the browser
 // This method is safe for concurrent use
@@ -137,20 +119,10 @@ func (m *manager) GetAuthURLWithState(providerName string) (string, string, erro
 		return "", "", ErrProviderNotFound
 	}
 
-	state, err := GenerateRandomString(32)
-	if err != nil {
-		return "", "", fmt.Errorf("failed to generate state: %w", err)
-	}
+	state := GenerateRandomString(32)
+	nonce := GenerateRandomString(32)
 
-	nonce, err := GenerateRandomString(32)
-	if err != nil {
-		return "", "", fmt.Errorf("failed to generate nonce: %w", err)
-	}
-
-	codeVerifier, err := GenerateCodeVerifier()
-	if err != nil {
-		return "", "", fmt.Errorf("failed to generate code verifier: %w", err)
-	}
+	codeVerifier := GenerateCodeVerifier()
 	codeChallenge := GenerateCodeChallenge(codeVerifier)
 
 	// Store state, nonce, and code verifier

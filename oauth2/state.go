@@ -2,6 +2,7 @@ package oauth2
 
 import (
 	"errors"
+	"maps"
 	"sync"
 	"time"
 )
@@ -19,11 +20,9 @@ const DefaultMaxStateEntries = 10_000
 // StateStorage interface for state, nonce, and PKCE verifier management
 type StateStorage interface {
 	SaveState(state string, nonce string, codeVerifier string, expiresAt time.Time) error
-	GetStateData(state string) (*StateData, error)
 	// ConsumeState atomically retrieves and deletes state data, so a state can
 	// be redeemed at most once even under concurrent callbacks.
 	ConsumeState(state string) (*StateData, error)
-	DeleteState(state string) error
 	Cleanup()
 }
 
@@ -88,28 +87,6 @@ func (s *InMemoryStorage) SaveState(state string, nonce string, codeVerifier str
 	return nil
 }
 
-// GetStateData retrieves state data by state string
-// Returns ErrStateNotFound if state doesn't exist
-// Returns ErrStateExpired if state exists but has expired (and deletes it)
-// This method is safe for concurrent use
-func (s *InMemoryStorage) GetStateData(state string) (*StateData, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	data, exists := s.data[state]
-	if !exists {
-		return nil, ErrStateNotFound
-	}
-
-	// Check expiration and delete immediately if expired
-	if time.Now().After(data.ExpiresAt) {
-		delete(s.data, state) // Clean up expired state immediately
-		return nil, ErrStateExpired
-	}
-
-	return data, nil
-}
-
 // ConsumeState retrieves and deletes state data in one step
 // Returns ErrStateNotFound if state doesn't exist (or was already consumed)
 // Returns ErrStateExpired if state exists but has expired
@@ -129,15 +106,6 @@ func (s *InMemoryStorage) ConsumeState(state string) (*StateData, error) {
 	}
 
 	return data, nil
-}
-
-// DeleteState removes state data from storage
-// This method is safe for concurrent use
-func (s *InMemoryStorage) DeleteState(state string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.data, state)
-	return nil
 }
 
 // Cleanup stops the background cleanup routine
@@ -173,9 +141,7 @@ func (s *InMemoryStorage) removeExpired() {
 // removeExpiredLocked deletes all expired states; the caller must hold s.mu
 func (s *InMemoryStorage) removeExpiredLocked() {
 	now := time.Now()
-	for state, data := range s.data {
-		if now.After(data.ExpiresAt) {
-			delete(s.data, state)
-		}
-	}
+	maps.DeleteFunc(s.data, func(_ string, data *StateData) bool {
+		return now.After(data.ExpiresAt)
+	})
 }
