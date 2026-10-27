@@ -121,7 +121,3 @@ make test                                  # all tests, integration needs Docker
 ## License
 
 MIT. See [LICENSE](../LICENSE).
-
-## Roadmap
-
-Planned features and design notes are in [ROADMAP.md](ROADMAP.md).
