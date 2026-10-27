@@ -33,8 +33,8 @@ Distilled from big-tech post-mortems and production patterns.
 
 Cache miss -> N concurrent reqs hit upstream. "Dogpile effect".
 
-- **Singleflight**: coalesce concurrent GETs for same key into 1 upstream call (done in `GetOrSet`, per process only; no cross-instance lock)
-- **TTL jitter**: randomize TTL +/- 10% to prevent mass expiry (done in `GetOrSet`)
+- **Singleflight**: coalesce concurrent GETs for same key into 1 upstream call (done in `cacheaside.GetOrSet`, per process only; no cross-instance lock)
+- **TTL jitter**: randomize TTL +/- 10% to prevent mass expiry (done in `cacheaside.GetOrSet`)
 - **Early refresh**: refresh before TTL expiry if request rate high
 
 | Post-mortem | Lesson |

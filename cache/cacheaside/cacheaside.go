@@ -1,9 +1,11 @@
-package cache
+package cacheaside
 
 import (
 	"context"
 	"math/rand/v2"
 	"time"
+
+	"cache"
 
 	"golang.org/x/sync/singleflight"
 )
@@ -39,7 +41,7 @@ type GetOrSetOptions struct {
 // GetOrSetRequest describes one GetOrSet call.
 type GetOrSetRequest struct {
 	// Cache is the store to read from and write to.
-	Cache Cache
+	Cache cache.Cache
 	// Key is the cache key. Load runs once per key within the process.
 	Key string
 	// TTL is the stored lifetime, varied by ±10%. Zero means no expiry.
@@ -121,12 +123,12 @@ func load(ctx context.Context, req GetOrSetRequest) (string, error) {
 // lookup returns the cached value and whether it was found. A read error other
 // than a miss is reported and treated as a miss. Once ctx has ended, the error
 // is a result of the caller leaving, so it is not reported.
-func lookup(ctx context.Context, c Cache, key string, o GetOrSetOptions) (string, bool) {
+func lookup(ctx context.Context, c cache.Cache, key string, o GetOrSetOptions) (string, bool) {
 	val, err := c.Get(ctx, key)
 	if err == nil {
 		return fromStore(val), true
 	}
-	if !IsCacheMiss(err) && ctx.Err() == nil {
+	if !cache.IsCacheMiss(err) && ctx.Err() == nil {
 		o.report(err)
 	}
 	return "", false

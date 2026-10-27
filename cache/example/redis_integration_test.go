@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"cache"
+	"cache/cacheaside"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -235,7 +236,7 @@ func TestGetOrSet_Hit(t *testing.T) {
 	require.NoError(t, c.Set(ctx, "gos-hit", "cached-value", time.Minute))
 
 	called := false
-	val, err := cache.GetOrSet(ctx, cache.GetOrSetRequest{Cache: c, Key: "gos-hit", TTL: time.Minute, Load: func(_ context.Context) (string, error) {
+	val, err := cacheaside.GetOrSet(ctx, cacheaside.GetOrSetRequest{Cache: c, Key: "gos-hit", TTL: time.Minute, Load: func(_ context.Context) (string, error) {
 		called = true
 		return "fn-value", nil
 	}})
@@ -248,7 +249,7 @@ func TestGetOrSet_Miss(t *testing.T) {
 	c := newCache(t, "gos-miss")
 	ctx := context.Background()
 
-	val, err := cache.GetOrSet(ctx, cache.GetOrSetRequest{Cache: c, Key: "gos-miss", TTL: time.Minute, Load: func(_ context.Context) (string, error) {
+	val, err := cacheaside.GetOrSet(ctx, cacheaside.GetOrSetRequest{Cache: c, Key: "gos-miss", TTL: time.Minute, Load: func(_ context.Context) (string, error) {
 		return "computed", nil
 	}})
 	require.NoError(t, err)
@@ -264,7 +265,7 @@ func TestGetOrSet_FnError(t *testing.T) {
 	c := newCache(t, "gos-err")
 	ctx := context.Background()
 
-	_, err := cache.GetOrSet(ctx, cache.GetOrSetRequest{Cache: c, Key: "gos-err", TTL: time.Minute, Load: func(_ context.Context) (string, error) {
+	_, err := cacheaside.GetOrSet(ctx, cacheaside.GetOrSetRequest{Cache: c, Key: "gos-err", TTL: time.Minute, Load: func(_ context.Context) (string, error) {
 		return "", assert.AnError
 	}})
 	assert.Error(t, err)
@@ -279,7 +280,7 @@ func TestGetOrSet_ContextCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	_, err := cache.GetOrSet(ctx, cache.GetOrSetRequest{Cache: c, Key: "gos-ctx", TTL: time.Minute, Load: func(_ context.Context) (string, error) {
+	_, err := cacheaside.GetOrSet(ctx, cacheaside.GetOrSetRequest{Cache: c, Key: "gos-ctx", TTL: time.Minute, Load: func(_ context.Context) (string, error) {
 		return "value", nil
 	}})
 	assert.Error(t, err)
@@ -295,7 +296,7 @@ func TestGetOrSet_ThunderingHerd(t *testing.T) {
 
 	for range n {
 		wg.Go(func() {
-			val, err := cache.GetOrSet(ctx, cache.GetOrSetRequest{Cache: c, Key: "gos-herd", TTL: time.Minute, Load: func(_ context.Context) (string, error) {
+			val, err := cacheaside.GetOrSet(ctx, cacheaside.GetOrSetRequest{Cache: c, Key: "gos-herd", TTL: time.Minute, Load: func(_ context.Context) (string, error) {
 				callCount.Add(1)
 				time.Sleep(10 * time.Millisecond)
 				return "herd-value", nil
@@ -325,23 +326,23 @@ func TestGetOrSet_UserProfileScenario(t *testing.T) {
 	var dbCallCount atomic.Int32
 
 	// Cache miss — GetOrSet calls fn (simulated DB query).
-	val, err := cache.GetOrSet(ctx, cache.GetOrSetRequest{Cache: c, Key: "profile:user-42", TTL: time.Minute, Load: func(_ context.Context) (string, error) {
+	val, err := cacheaside.GetOrSet(ctx, cacheaside.GetOrSetRequest{Cache: c, Key: "profile:user-42", TTL: time.Minute, Load: func(_ context.Context) (string, error) {
 		dbCallCount.Add(1)
 		u, ok := db["user-42"]
 		if !ok {
 			return "", nil
 		}
 		return u.name + "|" + u.email, nil
-	}, Options: cache.GetOrSetOptions{CacheNil: true}})
+	}, Options: cacheaside.GetOrSetOptions{CacheNil: true}})
 	require.NoError(t, err)
 	assert.Equal(t, "Alice|alice@example.com", val)
 	assert.Equal(t, int32(1), dbCallCount.Load(), "DB must be queried exactly once")
 
 	// Second call — cache hit, no DB query.
-	val, err = cache.GetOrSet(ctx, cache.GetOrSetRequest{Cache: c, Key: "profile:user-42", TTL: time.Minute, Load: func(_ context.Context) (string, error) {
+	val, err = cacheaside.GetOrSet(ctx, cacheaside.GetOrSetRequest{Cache: c, Key: "profile:user-42", TTL: time.Minute, Load: func(_ context.Context) (string, error) {
 		dbCallCount.Add(1)
 		return "should-not-reach", nil
-	}, Options: cache.GetOrSetOptions{CacheNil: true}})
+	}, Options: cacheaside.GetOrSetOptions{CacheNil: true}})
 	require.NoError(t, err)
 	assert.Equal(t, "Alice|alice@example.com", val)
 	assert.Equal(t, int32(1), dbCallCount.Load(), "DB must NOT be queried on cache hit")
@@ -351,12 +352,12 @@ func TestGetOrSet_UserProfileScenario(t *testing.T) {
 	dbCallCount.Store(0)
 	for range 10 {
 		wg.Go(func() {
-			val, err := cache.GetOrSet(ctx, cache.GetOrSetRequest{Cache: c, Key: "profile:user-stampede", TTL: time.Minute, Load: func(_ context.Context) (string, error) {
+			val, err := cacheaside.GetOrSet(ctx, cacheaside.GetOrSetRequest{Cache: c, Key: "profile:user-stampede", TTL: time.Minute, Load: func(_ context.Context) (string, error) {
 				dbCallCount.Add(1)
 				time.Sleep(10 * time.Millisecond)
 				u := db["user-42"]
 				return u.name + "|" + u.email, nil
-			}, Options: cache.GetOrSetOptions{CacheNil: true}})
+			}, Options: cacheaside.GetOrSetOptions{CacheNil: true}})
 			assert.NoError(t, err)
 			assert.Equal(t, "Alice|alice@example.com", val)
 		})
@@ -377,10 +378,10 @@ func TestGetOrSet_RedisUnreachable(t *testing.T) {
 
 	var reported atomic.Int32
 	var calls atomic.Int32
-	val, err := cache.GetOrSet(ctx, cache.GetOrSetRequest{Cache: down, Key: "unreachable", TTL: time.Minute, Load: func(_ context.Context) (string, error) {
+	val, err := cacheaside.GetOrSet(ctx, cacheaside.GetOrSetRequest{Cache: down, Key: "unreachable", TTL: time.Minute, Load: func(_ context.Context) (string, error) {
 		calls.Add(1)
 		return "from-loader", nil
-	}, Options: cache.GetOrSetOptions{OnError: func(error) { reported.Add(1) }}})
+	}, Options: cacheaside.GetOrSetOptions{OnError: func(error) { reported.Add(1) }}})
 	require.NoError(t, err)
 	assert.Equal(t, "from-loader", val)
 	assert.Equal(t, int32(1), calls.Load())
@@ -395,19 +396,19 @@ func TestGetOrSet_UserNotFoundScenario(t *testing.T) {
 	var dbCallCount atomic.Int32
 
 	// First call: user not found in DB, fn returns empty string.
-	val, err := cache.GetOrSet(ctx, cache.GetOrSetRequest{Cache: c, Key: "profile:user-999", TTL: time.Minute, Load: func(_ context.Context) (string, error) {
+	val, err := cacheaside.GetOrSet(ctx, cacheaside.GetOrSetRequest{Cache: c, Key: "profile:user-999", TTL: time.Minute, Load: func(_ context.Context) (string, error) {
 		dbCallCount.Add(1)
 		return "", nil
-	}, Options: cache.GetOrSetOptions{CacheNil: true}})
+	}, Options: cacheaside.GetOrSetOptions{CacheNil: true}})
 	require.NoError(t, err)
 	assert.Empty(t, val)
 	assert.Equal(t, int32(1), dbCallCount.Load())
 
 	// Second call: CacheNil hit — returns empty without calling fn.
-	val, err = cache.GetOrSet(ctx, cache.GetOrSetRequest{Cache: c, Key: "profile:user-999", TTL: time.Minute, Load: func(_ context.Context) (string, error) {
+	val, err = cacheaside.GetOrSet(ctx, cacheaside.GetOrSetRequest{Cache: c, Key: "profile:user-999", TTL: time.Minute, Load: func(_ context.Context) (string, error) {
 		dbCallCount.Add(1)
 		return "should-not-reach", nil
-	}, Options: cache.GetOrSetOptions{CacheNil: true}})
+	}, Options: cacheaside.GetOrSetOptions{CacheNil: true}})
 	require.NoError(t, err)
 	assert.Empty(t, val)
 	assert.Equal(t, int32(1), dbCallCount.Load(), "repeated not-found lookups must not hit DB")
