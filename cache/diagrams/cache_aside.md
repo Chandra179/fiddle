@@ -1,4 +1,4 @@
-# Cache-aside: `cacheaside.GetOrSet`
+# Cache-aside
 
 ## Big picture
 
