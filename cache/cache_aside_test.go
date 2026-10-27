@@ -41,11 +41,10 @@ func TestGetOrSet_RedisDownDegradesToLoader(t *testing.T) {
 	var reported atomic.Int32
 	var calls atomic.Int32
 
-	val, err := GetOrSet(ctx, c, "down", time.Minute, func(_ context.Context) (string, error) {
+	val, err := GetOrSet(ctx, GetOrSetRequest{Cache: c, Key: "down", TTL: time.Minute, Load: func(_ context.Context) (string, error) {
 		calls.Add(1)
 		return "loaded", nil
-	}, GetOrSetOptions{OnError: func(error) { reported.Add(1) }})
-
+	}, Options: GetOrSetOptions{OnError: func(error) { reported.Add(1) }}})
 	require.NoError(t, err)
 	assert.Equal(t, "loaded", val)
 	assert.Equal(t, int32(1), calls.Load())
@@ -60,10 +59,7 @@ func TestGetOrSet_WriteErrorStillReturnsValue(t *testing.T) {
 	writeErr := errors.New("OOM command not allowed")
 	var reported []error
 
-	val, err := GetOrSet(ctx, failingCache{Cache: c, setErr: writeErr}, "write-fails", time.Minute,
-		func(_ context.Context) (string, error) { return "computed", nil },
-		GetOrSetOptions{OnError: func(err error) { reported = append(reported, err) }})
-
+	val, err := GetOrSet(ctx, GetOrSetRequest{Cache: failingCache{Cache: c, setErr: writeErr}, Key: "write-fails", TTL: time.Minute, Load: func(_ context.Context) (string, error) { return "computed", nil }, Options: GetOrSetOptions{OnError: func(err error) { reported = append(reported, err) }}})
 	require.NoError(t, err)
 	assert.Equal(t, "computed", val)
 	assert.Contains(t, reported, writeErr)
@@ -79,10 +75,7 @@ func TestGetOrSet_ReadErrorIsNotAMiss(t *testing.T) {
 	require.NoError(t, mr.Set("read-fails", "stored"))
 
 	var reported []error
-	val, err := GetOrSet(ctx, failingCache{Cache: c, getErr: readErr}, "read-fails", time.Minute,
-		func(_ context.Context) (string, error) { return "loaded", nil },
-		GetOrSetOptions{OnError: func(err error) { reported = append(reported, err) }})
-
+	val, err := GetOrSet(ctx, GetOrSetRequest{Cache: failingCache{Cache: c, getErr: readErr}, Key: "read-fails", TTL: time.Minute, Load: func(_ context.Context) (string, error) { return "loaded", nil }, Options: GetOrSetOptions{OnError: func(err error) { reported = append(reported, err) }}})
 	require.NoError(t, err)
 	assert.Equal(t, "loaded", val, "a failed read must fall through to the loader")
 	assert.Contains(t, reported, readErr)
@@ -100,11 +93,11 @@ func TestGetOrSet_SlowLoaderRunsOnce(t *testing.T) {
 	// result of the one run, not start its own.
 	for range 10 {
 		wg.Go(func() {
-			val, err := GetOrSet(ctx, c, "slow", time.Minute, func(_ context.Context) (string, error) {
+			val, err := GetOrSet(ctx, GetOrSetRequest{Cache: c, Key: "slow", TTL: time.Minute, Load: func(_ context.Context) (string, error) {
 				calls.Add(1)
 				time.Sleep(700 * time.Millisecond)
 				return "slow-value", nil
-			}, GetOrSetOptions{LoadTimeout: 2 * time.Second})
+			}, Options: GetOrSetOptions{LoadTimeout: 2 * time.Second}})
 			assert.NoError(t, err)
 			assert.Equal(t, "slow-value", val)
 		})
@@ -120,11 +113,10 @@ func TestGetOrSet_LoadTimeoutBoundsLoad(t *testing.T) {
 
 	ctx := context.Background()
 
-	_, err := GetOrSet(ctx, c, "timeout", time.Minute, func(ctx context.Context) (string, error) {
+	_, err := GetOrSet(ctx, GetOrSetRequest{Cache: c, Key: "timeout", TTL: time.Minute, Load: func(ctx context.Context) (string, error) {
 		<-ctx.Done()
 		return "", ctx.Err()
-	}, GetOrSetOptions{LoadTimeout: 50 * time.Millisecond})
-
+	}, Options: GetOrSetOptions{LoadTimeout: 50 * time.Millisecond}})
 	assert.ErrorIs(t, err, context.DeadlineExceeded)
 	assert.False(t, mr.Exists("timeout"))
 }
@@ -145,14 +137,14 @@ func TestGetOrSet_CallerLeavingDoesNotCancelSharedLoad(t *testing.T) {
 	var leaveErr error
 	var wg sync.WaitGroup
 	wg.Go(func() {
-		_, leaveErr = GetOrSet(leaveCtx, c, "shared", time.Minute, fn)
+		_, leaveErr = GetOrSet(leaveCtx, GetOrSetRequest{Cache: c, Key: "shared", TTL: time.Minute, Load: fn})
 	})
 	time.Sleep(20 * time.Millisecond) // first caller starts the load
 
 	var waitVal string
 	var waitErr error
 	wg.Go(func() {
-		waitVal, waitErr = GetOrSet(ctx, c, "shared", time.Minute, fn)
+		waitVal, waitErr = GetOrSet(ctx, GetOrSetRequest{Cache: c, Key: "shared", TTL: time.Minute, Load: fn})
 	})
 	time.Sleep(20 * time.Millisecond) // second caller joins it
 	leave()
@@ -169,9 +161,9 @@ func TestGetOrSet_StoresJitteredTTL(t *testing.T) {
 	mr, c := setupTestRedis(t)
 	defer mr.Close()
 
-	_, err := GetOrSet(context.Background(), c, "jitter-ttl", time.Minute, func(_ context.Context) (string, error) {
+	_, err := GetOrSet(context.Background(), GetOrSetRequest{Cache: c, Key: "jitter-ttl", TTL: time.Minute, Load: func(_ context.Context) (string, error) {
 		return "v", nil
-	})
+	}})
 	require.NoError(t, err)
 
 	ttl := mr.TTL("jitter-ttl")

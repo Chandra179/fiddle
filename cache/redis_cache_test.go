@@ -364,19 +364,19 @@ func TestRedisCache_GetOrSet(t *testing.T) {
 		require.NoError(t, mr.Set("gos-hit", "cached-value"))
 
 		called := false
-		val, err := GetOrSet(ctx, cache, "gos-hit", time.Minute, func(_ context.Context) (string, error) {
+		val, err := GetOrSet(ctx, GetOrSetRequest{Cache: cache, Key: "gos-hit", TTL: time.Minute, Load: func(_ context.Context) (string, error) {
 			called = true
 			return "fn-value", nil
-		})
+		}})
 		assert.NoError(t, err)
 		assert.Equal(t, "cached-value", val)
 		assert.False(t, called, "fn must not be called on hit")
 	})
 
 	t.Run("cache miss calls fn and stores result", func(t *testing.T) {
-		val, err := GetOrSet(ctx, cache, "gos-miss", time.Minute, func(_ context.Context) (string, error) {
+		val, err := GetOrSet(ctx, GetOrSetRequest{Cache: cache, Key: "gos-miss", TTL: time.Minute, Load: func(_ context.Context) (string, error) {
 			return "computed-value", nil
-		})
+		}})
 		assert.NoError(t, err)
 		assert.Equal(t, "computed-value", val)
 
@@ -386,9 +386,9 @@ func TestRedisCache_GetOrSet(t *testing.T) {
 	})
 
 	t.Run("fn error propagated", func(t *testing.T) {
-		_, err := GetOrSet(ctx, cache, "gos-err", time.Minute, func(_ context.Context) (string, error) {
+		_, err := GetOrSet(ctx, GetOrSetRequest{Cache: cache, Key: "gos-err", TTL: time.Minute, Load: func(_ context.Context) (string, error) {
 			return "", assert.AnError
-		})
+		}})
 		assert.Error(t, err)
 		assert.ErrorIs(t, err, assert.AnError)
 
@@ -398,18 +398,18 @@ func TestRedisCache_GetOrSet(t *testing.T) {
 
 	t.Run("cache miss with nil result and CacheNil=true", func(t *testing.T) {
 		key := "gos-nil"
-		val, err := GetOrSet(ctx, cache, key, time.Minute, func(_ context.Context) (string, error) {
+		val, err := GetOrSet(ctx, GetOrSetRequest{Cache: cache, Key: key, TTL: time.Minute, Load: func(_ context.Context) (string, error) {
 			return "", nil
-		}, GetOrSetOptions{CacheNil: true})
+		}, Options: GetOrSetOptions{CacheNil: true}})
 		assert.NoError(t, err)
 		assert.Empty(t, val)
 
 		// Second call must not call fn (sentinel hit)
 		called := false
-		val, err = GetOrSet(ctx, cache, key, time.Minute, func(_ context.Context) (string, error) {
+		val, err = GetOrSet(ctx, GetOrSetRequest{Cache: cache, Key: key, TTL: time.Minute, Load: func(_ context.Context) (string, error) {
 			called = true
 			return "should-not-reach", nil
-		}, GetOrSetOptions{CacheNil: true})
+		}, Options: GetOrSetOptions{CacheNil: true}})
 		assert.NoError(t, err)
 		assert.Empty(t, val)
 		assert.False(t, called)
@@ -419,9 +419,9 @@ func TestRedisCache_GetOrSet(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 
-		_, err := GetOrSet(ctx, cache, "gos-cancel", time.Minute, func(_ context.Context) (string, error) {
+		_, err := GetOrSet(ctx, GetOrSetRequest{Cache: cache, Key: "gos-cancel", TTL: time.Minute, Load: func(_ context.Context) (string, error) {
 			return "value", nil
-		})
+		}})
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "context canceled")
 	})
@@ -440,10 +440,10 @@ func TestRedisCache_GetOrSet_ThunderingHerd(t *testing.T) {
 
 	for range n {
 		wg.Go(func() {
-			val, err := GetOrSet(ctx, cache, key, time.Minute, func(_ context.Context) (string, error) {
+			val, err := GetOrSet(ctx, GetOrSetRequest{Cache: cache, Key: key, TTL: time.Minute, Load: func(_ context.Context) (string, error) {
 				callCount.Add(1)
 				return "herd-value", nil
-			})
+			}})
 			assert.NoError(t, err)
 			assert.Equal(t, "herd-value", val)
 		})
@@ -459,9 +459,9 @@ func TestRedisCache_GetOrSet_CustomLoadTimeout(t *testing.T) {
 
 	ctx := context.Background()
 
-	val, err := GetOrSet(ctx, cache, "gos-loadtimeout", time.Minute, func(_ context.Context) (string, error) {
+	val, err := GetOrSet(ctx, GetOrSetRequest{Cache: cache, Key: "gos-loadtimeout", TTL: time.Minute, Load: func(_ context.Context) (string, error) {
 		return "custom-timeout", nil
-	}, GetOrSetOptions{LoadTimeout: 5 * time.Second})
+	}, Options: GetOrSetOptions{LoadTimeout: 5 * time.Second}})
 	assert.NoError(t, err)
 	assert.Equal(t, "custom-timeout", val)
 }
