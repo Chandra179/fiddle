@@ -1,4 +1,4 @@
-# Ghost
+# Fiddle
 
 This is a utility project for Golang. Each module lives in its own subdirectory with an independent `go.mod`.
 
@@ -6,7 +6,7 @@ This is a utility project for Golang. Each module lives in its own subdirectory 
 
 1. **Create a subdirectory** named after your module:
    ```
-   ghost/
+   fiddle/
    └── yourmodule/
        ├── go.mod
        ├── go.sum
