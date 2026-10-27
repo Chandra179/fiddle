@@ -1,3 +1,6 @@
+// Package cacheaside implements the cache-aside read path: GetOrSet loads on a
+// miss, coalesces concurrent loads per process, and degrades to the loader when
+// the cache fails.
 package cacheaside
 
 import (
