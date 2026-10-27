@@ -12,11 +12,13 @@ import (
 var ErrCacheMiss = errors.New("cache miss")
 
 // IsCacheMiss reports whether err represents a cache miss.
-// Use instead of comparing to redis.Nil directly.
+// Use it instead of comparing errors to a backend's nil sentinel.
 func IsCacheMiss(err error) bool {
 	return errors.Is(err, ErrCacheMiss)
 }
 
+// Cache is a key-value store with per-key expiry. Redis implements it; see
+// NewRedisCacheFromConfig. cacheaside works with any implementation.
 type Cache interface {
 	Set(ctx context.Context, key string, value string, ttl time.Duration) error
 	SetNX(ctx context.Context, key string, value string, ttl time.Duration) (bool, error)
