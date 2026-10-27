@@ -2,116 +2,137 @@ package cache
 
 import (
 	"context"
-	"crypto/rand"
+	"math/rand/v2"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 )
 
 const (
-	defaultLockTTL = 10 * time.Second
-	nilSentinel    = "\x00nil\x00"
-	lockSuffix     = ":lock"
-	// unlockTimeout bounds lock release, which runs even if ctx is cancelled.
-	unlockTimeout = time.Second
-	// waitTimeout is how long a caller that lost the lock waits for the winner
-	// to populate the key, polling with backoff between initialBackoff and
-	// maxBackoff, before computing the value itself.
-	waitTimeout    = 500 * time.Millisecond
-	initialBackoff = 5 * time.Millisecond
-	maxBackoff     = 50 * time.Millisecond
+	defaultLoadTimeout = 5 * time.Second
+	nilSentinel        = "\x00nil\x00"
+	// jitterFraction spreads expiry by up to ±10% so keys stored together do
+	// not expire together.
+	jitterFraction = 0.1
 )
 
+// loads coalesces concurrent loads for the same key within this process. It is
+// shared by every Cache in the process, so the same key on two Caches (for
+// example two Redis databases) shares one load.
+var loads singleflight.Group
+
+// GetOrSetOptions tunes one GetOrSet call. Zero values select the defaults.
 type GetOrSetOptions struct {
-	LockTTL  time.Duration
+	// LoadTimeout bounds one run of fn. Concurrent callers for the key wait for
+	// that run, so it also bounds their wait. Set it above the loader's p99
+	// latency. Defaults to 5s.
+	LoadTimeout time.Duration
+	// CacheNil stores an empty result as a sentinel, so a known-missing key is
+	// not reloaded on every call.
 	CacheNil bool
+	// OnError receives each cache error that GetOrSet recovered from: a failed
+	// read (treated as a miss) or a failed write (the value is still returned).
+	// Use it to count Redis failures. It may be nil.
+	OnError func(err error)
 }
 
-// GetOrSet is cache-aside with stampede protection. On a miss one caller takes a
-// lock, runs fn and stores the result; concurrent callers for the same key wait
-// up to waitTimeout for it, then run fn themselves (the holder crashed or its
-// lock TTL was too short).
+// GetOrSet is cache-aside with per-process stampede protection. On a miss,
+// concurrent callers for the same key share one run of fn and receive its
+// result. The result is stored with ttl, jittered by ±10%.
 //
-// Use it when fn is expensive, brief staleness is fine, and many goroutines or
-// machines may ask for the same key. It is not for write-through caching,
-// cache+DB transactions, or keys that change every few milliseconds.
+// Cache errors degrade to the loader instead of failing the call: a failed read
+// counts as a miss, and a failed write still returns the computed value. Both are
+// reported to OnError. Errors from fn and ctx cancellation are returned.
+//
+// Stampede protection covers one process only. Instances that miss at the same
+// moment each run fn once. Use it when fn is expensive, brief staleness is fine,
+// and many goroutines in a process may ask for the same key. It is not for
+// write-through caching, cache+DB transactions, or keys that change every few
+// milliseconds.
 func GetOrSet(ctx context.Context, c Cache, key string, ttl time.Duration, fn func(context.Context) (string, error), opts ...GetOrSetOptions) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	o := defaultGetOrSetOpts(opts...)
 
-	val, err := c.Get(ctx, key)
-	if err == nil {
-		return fromStore(val), nil
-	}
-	if !IsCacheMiss(err) {
-		return "", err
+	if val, ok := lookup(ctx, c, key, o); ok {
+		return val, nil
 	}
 
-	lockKey := key + lockSuffix
-	// Random token identifies this holder, so release never deletes a lock
-	// re-acquired by someone else after ours expired (fn outlived LockTTL).
-	token := rand.Text()
-	ok, err := c.SetNX(ctx, lockKey, token, o.LockTTL)
-	if err != nil {
-		return "", err
+	ch := loads.DoChan(key, func() (any, error) {
+		return load(ctx, c, key, ttl, fn, o)
+	})
+	// The caller stops waiting when its ctx ends. The load keeps running for
+	// the other callers.
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case res := <-ch:
+		if res.Err != nil {
+			return "", res.Err
+		}
+		return res.Val.(string), nil
 	}
-	if !ok {
-		// Another goroutine is computing the value.
-		return waitForValue(ctx, c, key, fn)
-	}
-
-	// Release survives caller cancellation so a cancelled request still frees
-	// the lock for spin-waiters and the next caller.
-	defer func() {
-		unlockCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), unlockTimeout)
-		defer cancel()
-		_, _ = c.DelIfValue(unlockCtx, lockKey, token)
-	}()
-	return loadAndStore(ctx, c, key, ttl, fn, o.CacheNil)
 }
 
-// loadAndStore runs fn and caches its result. The caller holds the key's lock.
-func loadAndStore(ctx context.Context, c Cache, key string, ttl time.Duration, fn func(context.Context) (string, error), cacheNil bool) (string, error) {
-	// Double-check cache: between the initial miss and lock acquisition,
-	// another lock holder may have populated the key already.
-	if val, err := c.Get(ctx, key); err == nil {
-		return fromStore(val), nil
+// load runs fn once for the key and stores the result. It runs inside the
+// singleflight group, so callers that started it may already have gone.
+func load(ctx context.Context, c Cache, key string, ttl time.Duration, fn func(context.Context) (string, error), o GetOrSetOptions) (string, error) {
+	// The load is not cancelled with the caller that started it, because other
+	// callers may be waiting on it. LoadTimeout bounds it instead.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), o.LoadTimeout)
+	defer cancel()
+
+	// Another process may have stored the key since our first read.
+	if val, ok := lookup(ctx, c, key, o); ok {
+		return val, nil
 	}
 
-	// Still a miss: compute the value via the user-provided fn (e.g. DB query, API call).
 	result, err := fn(ctx)
 	if err != nil {
 		return "", err
 	}
 
-	// Store the result so future callers hit instead of calling fn. An empty
-	// result with CacheNil enabled is stored as a sentinel, to avoid repeated
-	// fn calls for known-empty keys (e.g. user not found).
 	storeVal := result
-	if result == "" && cacheNil {
+	if result == "" && o.CacheNil {
 		storeVal = nilSentinel
 	}
-	if err := c.Set(ctx, key, storeVal, ttl); err != nil {
-		return "", err
+	if err := c.Set(ctx, key, storeVal, jitter(ttl)); err != nil {
+		// The value is still good. The next call will load it again.
+		o.report(err)
 	}
 	return result, nil
 }
 
-// waitForValue polls for the lock holder to populate key, with capped
-// exponential backoff, and falls back to computing the value itself when the
-// holder crashed or its lock TTL was too short.
-func waitForValue(ctx context.Context, c Cache, key string, fn func(context.Context) (string, error)) (string, error) {
-	backoff := initialBackoff
-	deadline := time.Now().Add(waitTimeout)
-	for time.Now().Before(deadline) {
-		select {
-		case <-ctx.Done():
-			return "", ctx.Err()
-		case <-time.After(backoff):
-		}
-		if val, err := c.Get(ctx, key); err == nil {
-			return fromStore(val), nil
-		}
-		backoff = min(backoff*2, maxBackoff)
+// lookup returns the cached value and whether it was found. A read error other
+// than a miss is reported and treated as a miss. Once ctx has ended, the error
+// is a result of the caller leaving, so it is not reported.
+func lookup(ctx context.Context, c Cache, key string, o GetOrSetOptions) (string, bool) {
+	val, err := c.Get(ctx, key)
+	if err == nil {
+		return fromStore(val), true
 	}
-	return fn(ctx)
+	if !IsCacheMiss(err) && ctx.Err() == nil {
+		o.report(err)
+	}
+	return "", false
+}
+
+func (o GetOrSetOptions) report(err error) {
+	if o.OnError != nil {
+		o.OnError(err)
+	}
+}
+
+// jitter returns ttl changed by up to ±jitterFraction. A non-positive ttl (no
+// expiry) is returned unchanged.
+func jitter(ttl time.Duration) time.Duration {
+	if ttl <= 0 {
+		return ttl
+	}
+	spread := float64(ttl) * jitterFraction
+	d := ttl + time.Duration((rand.Float64()*2-1)*spread)
+	return max(d, time.Nanosecond)
 }
 
 func fromStore(val string) string {
@@ -122,15 +143,14 @@ func fromStore(val string) string {
 }
 
 // defaultGetOrSetOpts returns the first option, or the defaults. A non-positive
-// LockTTL falls back to defaultLockTTL: a lock without an expiry would outlive a
-// crashed holder.
+// LoadTimeout falls back to defaultLoadTimeout, so a load always has a deadline.
 func defaultGetOrSetOpts(opts ...GetOrSetOptions) GetOrSetOptions {
 	var o GetOrSetOptions
 	if len(opts) > 0 {
 		o = opts[0]
 	}
-	if o.LockTTL <= 0 {
-		o.LockTTL = defaultLockTTL
+	if o.LoadTimeout <= 0 {
+		o.LoadTimeout = defaultLoadTimeout
 	}
 	return o
 }

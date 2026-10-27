@@ -365,92 +365,27 @@ func TestGetOrSet_UserProfileScenario(t *testing.T) {
 	assert.Equal(t, int32(1), dbCallCount.Load(), "concurrent requests must not trigger extra DB calls")
 }
 
-// Distributed stampede: 2 separate Cache instances (simulating 2 nodes)
-// contend for same key. Only 1 fn call across both.
-func TestGetOrSet_DistributedStampede(t *testing.T) {
+// Redis unreachable: reads and writes fail, so GetOrSet degrades to the loader
+// and reports each cache error.
+func TestGetOrSet_RedisUnreachable(t *testing.T) {
 	ctx := context.Background()
-
-	// Two independent clients = two separate "services" talking to same Redis.
-	node1 := cache.NewRedisCache(sharedAddr)
-	node2 := cache.NewRedisCache(sharedAddr)
-	t.Cleanup(func() { _ = node1.Close(); _ = node2.Close() })
-	t.Cleanup(func() {
-		_ = sharedCache.Del(ctx, "dist-stampede")
-		_ = sharedCache.Del(ctx, "dist-stampede:lock")
+	down := cache.NewRedisCacheFromConfig(cache.RedisConfig{
+		Addr:        "127.0.0.1:1", // nothing listens here
+		DialTimeout: 100 * time.Millisecond,
 	})
+	t.Cleanup(func() { _ = down.Close() })
 
-	var callCount atomic.Int32
-	var wg sync.WaitGroup
+	var reported atomic.Int32
+	var calls atomic.Int32
+	val, err := cache.GetOrSet(ctx, down, "unreachable", time.Minute, func(_ context.Context) (string, error) {
+		calls.Add(1)
+		return "from-loader", nil
+	}, cache.GetOrSetOptions{OnError: func(error) { reported.Add(1) }})
 
-	for range 5 {
-		wg.Go(func() {
-			val, err := cache.GetOrSet(ctx, node1, "dist-stampede", time.Minute, func(_ context.Context) (string, error) {
-				callCount.Add(1)
-				time.Sleep(20 * time.Millisecond)
-				return "dist-value", nil
-			})
-			assert.NoError(t, err)
-			assert.Equal(t, "dist-value", val)
-		})
-		wg.Go(func() {
-			val, err := cache.GetOrSet(ctx, node2, "dist-stampede", time.Minute, func(_ context.Context) (string, error) {
-				callCount.Add(1)
-				time.Sleep(20 * time.Millisecond)
-				return "dist-value", nil
-			})
-			assert.NoError(t, err)
-			assert.Equal(t, "dist-value", val)
-		})
-	}
-	wg.Wait()
-
-	assert.Equal(t, int32(1), callCount.Load(), "2 nodes, 10 total goroutines — fn must execute once across all")
-}
-
-// Lock-holder crash: lock TTL short, holder dies mid-compute.
-// Waiters spin-wait up to ~500ms, lock expires, fall through to fn.
-func TestGetOrSet_LockHolderCrash(t *testing.T) {
-	ctx := context.Background()
-	node1 := cache.NewRedisCache(sharedAddr)
-	node2 := cache.NewRedisCache(sharedAddr)
-	t.Cleanup(func() { _ = node1.Close(); _ = node2.Close() })
-	t.Cleanup(func() {
-		_ = sharedCache.Del(ctx, "crash-key")
-		_ = sharedCache.Del(ctx, "crash-key:lock")
-	})
-
-	var callCount atomic.Int32
-	var wg sync.WaitGroup
-	locked := make(chan struct{})
-
-	// Node1 acquires lock, sleeps past lock TTL AND past spin-wait deadline.
-	// Lock TTL=50ms (expires fast), fn sleeps 600ms (>500ms spin-wait cap).
-	// Node2's spin-wait exhausts -> falls through to fn.
-	wg.Go(func() {
-		val, err := cache.GetOrSet(ctx, node1, "crash-key", time.Minute, func(_ context.Context) (string, error) {
-			callCount.Add(1)
-			close(locked)
-			time.Sleep(600 * time.Millisecond)
-			return "crash-recovered", nil
-		}, cache.GetOrSetOptions{LockTTL: 50 * time.Millisecond})
-		assert.NoError(t, err)
-		assert.Equal(t, "crash-recovered", val)
-	})
-
-	<-locked
-
-	wg.Go(func() {
-		val, err := cache.GetOrSet(ctx, node2, "crash-key", time.Minute, func(_ context.Context) (string, error) {
-			callCount.Add(1)
-			return "crash-recovered", nil
-		}, cache.GetOrSetOptions{LockTTL: 50 * time.Millisecond})
-		assert.NoError(t, err)
-		assert.Equal(t, "crash-recovered", val)
-	})
-
-	wg.Wait()
-
-	assert.Equal(t, int32(2), callCount.Load(), "spin-wait exhausted — fallback must execute fn")
+	require.NoError(t, err)
+	assert.Equal(t, "from-loader", val)
+	assert.Equal(t, int32(1), calls.Load())
+	assert.Positive(t, reported.Load())
 }
 
 // Real-world scenario: user not found — CacheNil prevents repeated DB lookups.

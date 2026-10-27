@@ -453,17 +453,17 @@ func TestRedisCache_GetOrSet_ThunderingHerd(t *testing.T) {
 	assert.Equal(t, int32(1), callCount.Load(), "fn must be called exactly once")
 }
 
-func TestRedisCache_GetOrSet_CustomLockTTL(t *testing.T) {
+func TestRedisCache_GetOrSet_CustomLoadTimeout(t *testing.T) {
 	mr, cache := setupTestRedis(t)
 	defer mr.Close()
 
 	ctx := context.Background()
 
-	val, err := GetOrSet(ctx, cache, "gos-lockttl", time.Minute, func(_ context.Context) (string, error) {
-		return "custom-lock", nil
-	}, GetOrSetOptions{LockTTL: 5 * time.Second})
+	val, err := GetOrSet(ctx, cache, "gos-loadtimeout", time.Minute, func(_ context.Context) (string, error) {
+		return "custom-timeout", nil
+	}, GetOrSetOptions{LoadTimeout: 5 * time.Second})
 	assert.NoError(t, err)
-	assert.Equal(t, "custom-lock", val)
+	assert.Equal(t, "custom-timeout", val)
 }
 
 func TestNewRedisCacheFromConfig(t *testing.T) {
@@ -536,49 +536,4 @@ func TestRedisCache_DelIfValue(t *testing.T) {
 		require.NoError(t, err)
 		assert.False(t, deleted)
 	})
-}
-
-// Leader's fn outlives LockTTL, another owner takes the lock; the leader's
-// release must leave the new owner's lock intact.
-func TestRedisCache_GetOrSet_ReleaseKeepsOtherOwnersLock(t *testing.T) {
-	mr, cache := setupTestRedis(t)
-	defer mr.Close()
-
-	ctx := context.Background()
-	key := "gos-steal"
-	lockKey := key + lockSuffix
-
-	val, err := GetOrSet(ctx, cache, key, time.Minute, func(ctx context.Context) (string, error) {
-		token, err := mr.Get(lockKey)
-		require.NoError(t, err)
-		assert.NotEqual(t, lockKey, token, "lock value must be a random token")
-
-		mr.FastForward(2 * time.Second) // leader's lock expires
-		ok, err := cache.SetNX(ctx, lockKey, "other-owner", time.Minute)
-		require.NoError(t, err)
-		require.True(t, ok, "other owner must acquire expired lock")
-		return "leader-value", nil
-	}, GetOrSetOptions{LockTTL: time.Second})
-	require.NoError(t, err)
-	assert.Equal(t, "leader-value", val)
-
-	owner, err := mr.Get(lockKey)
-	require.NoError(t, err, "other owner's lock must survive leader's release")
-	assert.Equal(t, "other-owner", owner)
-}
-
-// A request cancelled while computing must still release its lock.
-func TestRedisCache_GetOrSet_CancelledRequestReleasesLock(t *testing.T) {
-	mr, cache := setupTestRedis(t)
-	defer mr.Close()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	key := "gos-cancel-release"
-
-	_, err := GetOrSet(ctx, cache, key, time.Minute, func(_ context.Context) (string, error) {
-		cancel()
-		return "value", nil
-	})
-	assert.ErrorIs(t, err, context.Canceled)
-	assert.False(t, mr.Exists(key+lockSuffix), "lock must be released despite cancelled ctx")
 }
