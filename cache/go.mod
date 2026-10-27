@@ -1,4 +1,4 @@
-module cache
+module github.com/Chandra179/fiddle/cache
 
 go 1.27.2
 

@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"cache"
+	"github.com/Chandra179/fiddle/cache"
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/stretchr/testify/assert"

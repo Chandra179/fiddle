@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"cache"
-	"cache/cacheaside"
+	"github.com/Chandra179/fiddle/cache"
+	"github.com/Chandra179/fiddle/cache/cacheaside"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

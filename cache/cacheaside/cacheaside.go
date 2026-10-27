@@ -5,7 +5,7 @@ import (
 	"math/rand/v2"
 	"time"
 
-	"cache"
+	"github.com/Chandra179/fiddle/cache"
 
 	"golang.org/x/sync/singleflight"
 )
