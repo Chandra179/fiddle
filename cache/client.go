@@ -1,5 +1,5 @@
-// Package cache is a Redis client with a minimal Cache interface. Use
-// NewRedisCacheFromConfig to build one.
+// Package cache defines a minimal key-value cache interface. Redis is the
+// bundled implementation: use NewRedisCacheFromConfig to build one.
 package cache
 
 import (

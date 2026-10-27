@@ -1,6 +1,6 @@
-# cache — Redis wrapper for Go
+# cache — caching for Go
 
-Production-grade Redis cache wrapper. Minimal surface, battle-tested patterns.
+A small key-value `Cache` interface with a cache-aside helper. Redis is the bundled implementation. Minimal surface, battle-tested patterns.
 
 ## Install
 
@@ -80,6 +80,7 @@ type Cache interface {
 }
 ```
 
+- `Cache` is backend-neutral. `cacheaside` works with any implementation; `redis_cache.go` provides one backed by Redis.
 - `NewRedisCacheFromConfig(RedisConfig)` builds a `Cache` with auth, TLS, DB, pool, and timeout settings. It does not connect; a failure shows on the first operation. `NewRedisCache(addr)` is the no-auth shortcut.
 - `Get` returns `ErrCacheMiss` for a missing key. Check it with `cache.IsCacheMiss(err)`.
 - `SetNX` and `DelIfValue` are low-level primitives. `cacheaside.GetOrSet` does not use them.
