@@ -113,7 +113,11 @@ func load(ctx context.Context, req GetOrSetRequest) (string, error) {
 	}
 
 	storeVal := result
-	if result == "" && req.Options.CacheNil {
+	if result == "" {
+		// Without CacheNil an empty result is not stored, so the next call loads again.
+		if !req.Options.CacheNil {
+			return result, nil
+		}
 		storeVal = nilSentinel
 	}
 	if err := req.Cache.Set(ctx, req.Key, storeVal, jitter(req.TTL)); err != nil {

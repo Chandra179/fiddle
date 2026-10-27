@@ -260,6 +260,22 @@ func TestRedisCache_GetOrSet(t *testing.T) {
 		assert.False(t, called)
 	})
 
+	t.Run("empty result is not stored when CacheNil=false", func(t *testing.T) {
+		key := "gos-nil-off"
+		calls := 0
+		load := func(_ context.Context) (string, error) {
+			calls++
+			return "", nil
+		}
+		for range 2 {
+			val, err := GetOrSet(ctx, GetOrSetRequest{Cache: cache, Key: key, TTL: time.Minute, Load: load})
+			assert.NoError(t, err)
+			assert.Empty(t, val)
+		}
+		assert.Equal(t, 2, calls, "empty result must be reloaded when CacheNil=false")
+		assert.False(t, mr.Exists(key))
+	})
+
 	t.Run("context cancellation propagated", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
