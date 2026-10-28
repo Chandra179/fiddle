@@ -1,3 +1,16 @@
+---
+title: "Cache Aside"
+created: 2026-10-27
+tags: [cache, architecture, redis, software-design, golang]
+description: "How the cache-aside pattern works and how cacheaside.GetOrSet implements its read path in Go."
+seoTitle: "Cache Aside Pattern in Go"
+seoDescription: "Cache-aside pattern in Go: read path, stampede protection, failure handling, and when to use it with Redis."
+answerSummary: "Cache aside is a read pattern: the application checks the cache first, loads from the source on a miss, and stores the result. cacheaside.GetOrSet implements this read path with per-process stampede protection and graceful degradation when Redis fails. Writes and invalidation remain the caller's responsibility."
+links:
+  github: "https://github.com/Chandra179/fiddle/blob/main/cache/cacheaside/cacheaside.go"
+updated: 2026-10-28
+---
+
 # Cache-aside
 
 ## Big picture
