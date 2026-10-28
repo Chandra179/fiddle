@@ -15,11 +15,10 @@ GOVULNCHECK ?= go run golang.org/x/vuln/cmd/govulncheck@v1.9.0
 tidy:
 	go mod tidy -diff
 
-# Also vets the integration-tagged tests.
 vet:
-	go vet -tags integration ./...
+	go vet ./...
 
-# Unit tests under the race detector; no Docker.
+# Tests under the race detector.
 test-race:
 	go test -race -count=1 ./...
 
@@ -28,10 +27,9 @@ lint:
 	golangci-lint run ./...
 
 # Reports known vulnerabilities that the module's code actually reaches,
-# including test code and the integration-tagged tests.
+# including test code.
 vuln:
-	$(GOVULNCHECK) -tags integration -test ./...
+	$(GOVULNCHECK) -test ./...
 
-# Everything CI checks that needs no Docker. The integration tests run
-# separately (`make test`).
+# Everything CI checks.
 check: tidy vet test-race lint vuln

@@ -2,16 +2,13 @@
 # module, so run it from the module directory (golangci-lint finds this file in
 # a parent directory):
 #
-#   cd db && golangci-lint run --build-tags integration ./...
+#   cd db && golangci-lint run ./...
 #
 # The root Makefile does this for all modules: `make lint`.
 version: "2"
 
 run:
   timeout: 5m
-  # Lint the integration tests (db/, kafka/, rabbitmq/, cache/example, ...) too.
-  build-tags:
-    - integration
 
 linters:
   # standard: errcheck, govet, ineffassign, staticcheck, unused

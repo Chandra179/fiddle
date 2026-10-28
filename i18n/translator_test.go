@@ -13,7 +13,7 @@ func TestLocalizerCache_BoundedBySupportedLocales(t *testing.T) {
 	tr, err := NewTranslator(Config{
 		DefaultLocale:  "en",
 		FallbackLocale: "en",
-		MessageFiles:   []string{"example/testdata/en.json", "example/testdata/es.json"},
+		MessageFiles:   []string{"testdata/en.json", "testdata/es.json"},
 	})
 	require.NoError(t, err)
 
@@ -39,7 +39,7 @@ func TestLocalizerCache_BoundedBySupportedLocales(t *testing.T) {
 func TestTranslate_RegionalVariantMatchesBase(t *testing.T) {
 	tr, err := NewTranslator(Config{
 		DefaultLocale: "en",
-		MessageFiles:  []string{"example/testdata/en.json", "example/testdata/es.json"},
+		MessageFiles:  []string{"testdata/en.json", "testdata/es.json"},
 	})
 	require.NoError(t, err)
 

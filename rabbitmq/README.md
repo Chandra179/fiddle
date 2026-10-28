@@ -505,9 +505,5 @@ bc.StartBatchConsumer(ctx, rabbitmq.ConsumeOptions{
 ## Testing
 
 ```bash
-cd rabbitmq && go test ./...    # unit tests, no Docker
-cd rabbitmq && make test        # + integration tests
-# Expands to: go test -tags integration -v -count=1 -timeout 300s ./...
+cd rabbitmq && make test    # go test -count=1 -timeout 120s ./...
 ```
-
-The integration tests (build tag `integration`) require Docker (testcontainers with `rabbitmq:4.2-management-alpine`). Outage tests do not restart the container: they route the client through an in-process TCP proxy and cut it, so the broker's mapped port never changes.

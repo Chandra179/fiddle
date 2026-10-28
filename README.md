@@ -12,9 +12,8 @@ This is a utility project for Golang. Each module lives in its own subdirectory 
        ├── go.sum
        ├── yourmodule.go             # public API / interfaces
        ├── impl.go                   # implementation(s)
-       ├── Makefile                  # at minimum: a `test` target; include ../Makefile.common for lint/vuln
-       └── example/
-           └── integration_test.go  # integration tests using testcontainers or similar
+       ├── yourmodule_test.go        # tests
+       └── Makefile                  # at minimum: a `test` target; include ../Makefile.common for lint/vuln
    ```
 
 2. **`go.mod`** — use a simple module name matching the directory:
@@ -28,29 +27,16 @@ This is a utility project for Golang. Each module lives in its own subdirectory 
 
 4. **Implementation file** — implement the interfaces declared in the API file. Unexported types are fine; expose only constructors (e.g. `NewXxxClient`).
 
-5. **`Makefile`** — include at least an integration test target, and the shared `lint` and `vuln` targets:
+5. **`Makefile`** — include at least a `test` target, and the shared `lint` and `vuln` targets:
    ```makefile
    .PHONY: test
 
    include ../Makefile.common
 
    test:
-   	go test -tags integration -v -count=1 -timeout 300s ./...
+   	go test -count=1 -timeout 120s ./...
    ```
-   Put the `//go:build integration` tag on every test file that needs Docker (or any other external service), so that a plain `go test ./...` runs only the unit tests. Add the module to `MODULES` in the root `Makefile` and to the matrices in `.github/workflows/ci.yml`.
-
-6. **`example/` integration tests** — use `TestMain` to spin up any required infrastructure (e.g. a Testcontainers container) once for the whole suite, then share the connection across tests to keep suite startup time flat:
-   ```go
-   func TestMain(m *testing.M) {
-       // start container / external dependency once
-       // populate a package-level DSN / client var
-       code := m.Run()
-       // teardown
-       os.Exit(code)
-   }
-   ```
-
-   Helpers like `newClient(t, cfg)` should register cleanup via `t.Cleanup` so individual tests never call `Close` manually.
+   Add the module to `MODULES` in the root `Makefile` and to the matrix in `.github/workflows/ci.yml`.
 
 ## Example: `db` module
 
@@ -60,8 +46,7 @@ The `db/` module is the canonical reference implementation. It provides a Postgr
 |------|---------|
 | `db/client.go` | Sentinel errors, `DBTX`, `SQLExecutor`, `DB` interfaces, `ConnectionConfig` |
 | `db/postgres.go` | `NewPostgresClient` constructor and `postgresClient` implementation (pgx through `database/sql`) |
-| `db/Makefile` | `test` target running integration tests with `-tags integration`, plus `test-unit`, `lint` and `vuln` |
-| `db/example/postgres_integration_test.go` | Full integration test suite using Testcontainers |
+| `db/Makefile` | `test` target, plus the shared `lint` and `vuln` |
 
 ### Interface hierarchy
 
@@ -119,14 +104,13 @@ The driver is pgx through `database/sql`.
 Run from the repo root to cover every module, or `make <target>` inside one module:
 
 ```bash
-make test-unit   # tests that need no Docker
-make test        # everything; the integration tests need Docker
+make test        # all tests
 make lint        # golangci-lint, configured by .golangci.yml
 make vuln        # govulncheck
-make check       # tidy, vet, race tests, lint and vuln: what CI checks without Docker
+make check       # tidy, vet, race tests, lint and vuln: what CI checks
 ```
 
-CI (`.github/workflows/ci.yml`) runs the same targets per module, plus the integration tests.
+CI (`.github/workflows/ci.yml`) runs the same targets per module.
 
 ## Prompt
 see proven implementation from big companies, do we need abstraction? is it general implementation? do the implementation handle specific usecase only or general? is it configurable or not? document it in architecture decision record in adr.md in the directory if not exist create one.
