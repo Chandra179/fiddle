@@ -5,6 +5,7 @@ package cacheaside
 
 import (
 	"context"
+	"fmt"
 	"math/rand/v2"
 	"time"
 
@@ -15,16 +16,24 @@ import (
 
 const (
 	defaultLoadTimeout = 5 * time.Second
-	nilSentinel        = "\x00nil\x00"
+	// cacheOpTimeout bounds each cache read or write made inside a load, so a
+	// slow cache cannot use up the time LoadTimeout gives the loader.
+	cacheOpTimeout = time.Second
+	nilSentinel    = "\x00nil\x00"
 	// jitterFraction spreads expiry by up to ±10% so keys stored together do
 	// not expire together.
 	jitterFraction = 0.1
 )
 
 // loads coalesces concurrent loads for the same key within this process. It is
-// shared by every Cache in the process, so the same key on two Caches (for
-// example two Redis databases) shares one load.
+// keyed by Cache instance and key, so the same key on two Caches (for example
+// two Redis databases) loads separately.
 var loads singleflight.Group
+
+// flightKey scopes key to the Cache it is stored in.
+func flightKey(c cache.Cache, key string) string {
+	return fmt.Sprintf("%p\x00%s", c, key)
+}
 
 // GetOrSetOptions tunes one GetOrSet call. Zero values select the defaults.
 type GetOrSetOptions struct {
@@ -45,11 +54,14 @@ type GetOrSetOptions struct {
 type GetOrSetRequest struct {
 	// Cache is the store to read from and write to.
 	Cache cache.Cache
-	// Key is the cache key. Load runs once per key within the process.
+	// Key is the cache key. Load runs once per Cache and key within the process.
 	Key string
-	// TTL is the stored lifetime, varied by ±10%. Zero means no expiry.
+	// TTL is the stored lifetime, varied by ±10%. Zero or negative means no expiry.
 	TTL time.Duration
-	// Load computes the value on a miss.
+	// Load computes the value on a miss. It must report failures by returning an
+	// error, never by panicking: a panic in Load cannot be recovered by the
+	// caller and ends the process. A result equal to the internal nil sentinel
+	// ("\x00nil\x00") reads back as an empty string.
 	Load func(context.Context) (string, error)
 	// Options tunes the call. Zero values select the defaults.
 	Options GetOrSetOptions
@@ -74,11 +86,11 @@ func GetOrSet(ctx context.Context, req GetOrSetRequest) (string, error) {
 	}
 	req.Options = withDefaults(req.Options)
 
-	if val, ok := lookup(ctx, req.Cache, req.Key, req.Options); ok {
+	if val, ok := lookup(ctx, ctx, req.Cache, req.Key, req.Options); ok {
 		return val, nil
 	}
 
-	ch := loads.DoChan(req.Key, func() (any, error) {
+	ch := loads.DoChan(flightKey(req.Cache, req.Key), func() (any, error) {
 		return load(ctx, req)
 	})
 	// The caller stops waiting when its ctx ends. The load keeps running for
@@ -103,7 +115,10 @@ func load(ctx context.Context, req GetOrSetRequest) (string, error) {
 	defer cancel()
 
 	// Another process may have stored the key since our first read.
-	if val, ok := lookup(ctx, req.Cache, req.Key, req.Options); ok {
+	readCtx, cancelRead := context.WithTimeout(ctx, cacheOpTimeout)
+	val, ok := lookup(ctx, readCtx, req.Cache, req.Key, req.Options)
+	cancelRead()
+	if ok {
 		return val, nil
 	}
 
@@ -120,7 +135,10 @@ func load(ctx context.Context, req GetOrSetRequest) (string, error) {
 		}
 		storeVal = nilSentinel
 	}
-	if err := req.Cache.Set(ctx, req.Key, storeVal, jitter(req.TTL)); err != nil {
+	// Set gets its own budget: Load may have used all of ctx.
+	writeCtx, cancelWrite := context.WithTimeout(context.WithoutCancel(ctx), cacheOpTimeout)
+	defer cancelWrite()
+	if err := req.Cache.Set(writeCtx, req.Key, storeVal, jitter(max(req.TTL, 0))); err != nil {
 		// The value is still good. The next call will load it again.
 		req.Options.report(err)
 	}
@@ -129,9 +147,11 @@ func load(ctx context.Context, req GetOrSetRequest) (string, error) {
 
 // lookup returns the cached value and whether it was found. A read error other
 // than a miss is reported and treated as a miss. Once ctx has ended, the error
-// is a result of the caller leaving, so it is not reported.
-func lookup(ctx context.Context, c cache.Cache, key string, o GetOrSetOptions) (string, bool) {
-	val, err := c.Get(ctx, key)
+// is a result of the caller leaving, so it is not reported. The read itself
+// runs under readCtx, which may be a shorter-lived child of ctx: its timeout is
+// a cache failure and is reported.
+func lookup(ctx, readCtx context.Context, c cache.Cache, key string, o GetOrSetOptions) (string, bool) {
+	val, err := c.Get(readCtx, key)
 	if err == nil {
 		return fromStore(val), true
 	}

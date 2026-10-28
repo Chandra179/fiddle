@@ -326,3 +326,81 @@ func TestRedisCache_GetOrSet_CustomLoadTimeout(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, "custom-timeout", val)
 }
+
+// hangingReadCache misses on the first Get, then blocks every later Get until
+// its ctx ends, like a cache that stops answering mid-request.
+type hangingReadCache struct {
+	cache.Cache
+	gets atomic.Int32
+}
+
+func (h *hangingReadCache) Get(ctx context.Context, _ string) (string, error) {
+	if h.gets.Add(1) == 1 {
+		return "", cache.ErrCacheMiss
+	}
+	<-ctx.Done()
+	return "", ctx.Err()
+}
+
+func TestGetOrSet_SlowCacheDoesNotStarveLoader(t *testing.T) {
+	mr, c := setupTestRedis(t)
+	defer mr.Close()
+
+	var remaining time.Duration
+	var reported atomic.Int32
+	val, err := GetOrSet(context.Background(), GetOrSetRequest{Cache: &hangingReadCache{Cache: c}, Key: "slow-cache", TTL: time.Minute,
+		Load: func(ctx context.Context) (string, error) {
+			dl, _ := ctx.Deadline()
+			remaining = time.Until(dl)
+			return "v", nil
+		},
+		Options: GetOrSetOptions{LoadTimeout: 5 * time.Second, OnError: func(error) { reported.Add(1) }}})
+	require.NoError(t, err)
+	assert.Equal(t, "v", val)
+	// The hung read costs cacheOpTimeout, not the loader's whole budget.
+	assert.Greater(t, remaining, 3*time.Second)
+	assert.Equal(t, int32(1), reported.Load(), "the read timeout must reach OnError")
+}
+
+func TestGetOrSet_SameKeyOnDifferentCachesLoadsSeparately(t *testing.T) {
+	mr1, c1 := setupTestRedis(t)
+	defer mr1.Close()
+	mr2, c2 := setupTestRedis(t)
+	defer mr2.Close()
+
+	ctx := context.Background()
+	var calls atomic.Int32
+	load := func(v string) func(context.Context) (string, error) {
+		return func(context.Context) (string, error) {
+			calls.Add(1)
+			time.Sleep(100 * time.Millisecond)
+			return v, nil
+		}
+	}
+
+	var wg sync.WaitGroup
+	var v1, v2 string
+	wg.Go(func() {
+		v1, _ = GetOrSet(ctx, GetOrSetRequest{Cache: c1, Key: "same", TTL: time.Minute, Load: load("one")})
+	})
+	wg.Go(func() {
+		v2, _ = GetOrSet(ctx, GetOrSetRequest{Cache: c2, Key: "same", TTL: time.Minute, Load: load("two")})
+	})
+	wg.Wait()
+
+	assert.Equal(t, "one", v1)
+	assert.Equal(t, "two", v2)
+	assert.Equal(t, int32(2), calls.Load())
+}
+
+func TestGetOrSet_NegativeTTLMeansNoExpiry(t *testing.T) {
+	mr, c := setupTestRedis(t)
+	defer mr.Close()
+
+	_, err := GetOrSet(context.Background(), GetOrSetRequest{Cache: c, Key: "neg-ttl", TTL: -time.Second, Load: func(context.Context) (string, error) {
+		return "v", nil
+	}})
+	require.NoError(t, err)
+	assert.True(t, mr.Exists("neg-ttl"))
+	assert.Zero(t, mr.TTL("neg-ttl"), "negative ttl must store without expiry")
+}

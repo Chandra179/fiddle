@@ -196,6 +196,15 @@ func TestRedisCache_SetNX(t *testing.T) {
 		assert.False(t, exists)
 	})
 
+	t.Run("setnx rejects non-positive ttl", func(t *testing.T) {
+		for _, ttl := range []time.Duration{0, -time.Second} {
+			ok, err := cache.SetNX(ctx, "setnx-bad-ttl", "v", ttl)
+			assert.ErrorIs(t, err, ErrInvalidTTL)
+			assert.False(t, ok)
+		}
+		assert.False(t, mr.Exists("setnx-bad-ttl"))
+	})
+
 	t.Run("setnx after key expires", func(t *testing.T) {
 		ok, err := cache.SetNX(ctx, "expire-then-setnx", "first-value", 1*time.Second)
 		assert.NoError(t, err)

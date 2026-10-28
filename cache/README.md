@@ -86,6 +86,7 @@ type Cache interface {
 - `NewRedisCacheFromConfig(RedisConfig)` builds a `Cache` with auth, TLS, DB, pool, and timeout settings. It does not connect; a failure shows on the first operation. `NewRedisCache(addr)` is the no-auth shortcut.
 - `Get` returns `ErrCacheMiss` for a missing key. Check it with `cache.IsCacheMiss(err)`.
 - `SetNX` and `DelIfValue` are low-level primitives. `cacheaside.GetOrSet` does not use them.
+- `SetNX` requires a positive TTL and returns `ErrInvalidTTL` otherwise, because a lock without an expiry is never released if its holder crashes.
 
 ## Cache-aside (`cache/cacheaside`)
 
@@ -95,11 +96,18 @@ type Cache interface {
 |---|---|
 | Stampede control | Concurrent misses for one key share one `Load` per process. Not coordinated across instances. |
 | TTL jitter | Stored TTL varies by ±10%, so keys do not expire together. |
-| `LoadTimeout` | Bounds one `Load` (default 5s). Callers waiting on the same key share this budget. |
+| `LoadTimeout` | Bounds one `Load` (default 5s). Callers waiting on the same key share this budget. The cache read and write around `Load` have their own 1s limit each. |
 | Degradation | A failed read counts as a miss. A failed write still returns the value. Both are reported to `OnError`. |
 | `CacheNil` | Optionally stores empty results so known-missing keys are not reloaded. |
 
-Each `GetOrSet` call takes a `cacheaside.GetOrSetRequest`. Keys must be unique per source: concurrent loads share one singleflight group across every `Cache` in the process.
+Each `GetOrSet` call takes a `cacheaside.GetOrSetRequest`. Concurrent loads are shared per `Cache` instance and key, so the same key on two caches loads separately. Keys must still be unique per source within one cache.
+
+Caveats:
+
+- `Load` must return failures as errors and must not panic. A panic in `Load` cannot be recovered by the caller and ends the process.
+- A `Load` result equal to the internal nil sentinel (`"\x00nil\x00"`) reads back as an empty string.
+- A `Del` that lands while a `Load` is in flight can be overwritten by that load's stale result, which then stays cached for a full TTL.
+- A zero or negative `TTL` stores the value without expiry.
 
 ## Package layout
 
