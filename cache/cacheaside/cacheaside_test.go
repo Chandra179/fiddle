@@ -186,7 +186,7 @@ func TestGetOrSet_StoresJitteredTTL(t *testing.T) {
 
 func TestJitter(t *testing.T) {
 	assert.Equal(t, time.Duration(0), jitter(0), "no expiry stays no expiry")
-	assert.Equal(t, -time.Second, jitter(-time.Second), "negative ttl is unchanged")
+	assert.Equal(t, time.Duration(0), jitter(-time.Second), "negative ttl means no expiry")
 
 	base := time.Minute
 	seen := map[time.Duration]bool{}
@@ -403,4 +403,18 @@ func TestGetOrSet_NegativeTTLMeansNoExpiry(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, mr.Exists("neg-ttl"))
 	assert.Zero(t, mr.TTL("neg-ttl"), "negative ttl must store without expiry")
+}
+
+// valueCache is a non-pointer Cache, which flightKey cannot tell apart.
+type valueCache struct{ cache.Cache }
+
+func TestFlightKey(t *testing.T) {
+	mr, c := setupTestRedis(t)
+	defer mr.Close()
+	mr2, c2 := setupTestRedis(t)
+	defer mr2.Close()
+
+	assert.NotEqual(t, flightKey(c, "k"), flightKey(c2, "k"), "distinct pointer caches get distinct keys")
+	assert.Equal(t, flightKey(c, "k"), flightKey(c, "k"))
+	assert.Equal(t, "k", flightKey(valueCache{c}, "k"), "non-pointer cache falls back to the bare key")
 }

@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand/v2"
+	"reflect"
 	"time"
 
 	"github.com/Chandra179/fiddle/cache"
@@ -30,16 +31,22 @@ const (
 // two Redis databases) loads separately.
 var loads singleflight.Group
 
-// flightKey scopes key to the Cache it is stored in.
+// flightKey scopes key to the Cache it is stored in. Scoping needs a pointer
+// Cache, which every constructor here returns; any other Cache shares loads by
+// key alone.
 func flightKey(c cache.Cache, key string) string {
-	return fmt.Sprintf("%p\x00%s", c, key)
+	if v := reflect.ValueOf(c); v.Kind() == reflect.Pointer {
+		return fmt.Sprintf("%x\x00%s", v.Pointer(), key)
+	}
+	return key
 }
 
 // GetOrSetOptions tunes one GetOrSet call. Zero values select the defaults.
 type GetOrSetOptions struct {
 	// LoadTimeout bounds one run of Load. Concurrent callers for the key wait for
 	// that run, so it also bounds their wait. Set it above the loader's p99
-	// latency. Defaults to 5s.
+	// latency. Defaults to 5s. The cache read before and the write after Load
+	// have their own 1s limit each, so a caller can wait slightly longer.
 	LoadTimeout time.Duration
 	// CacheNil stores an empty result as a sentinel, so a known-missing key is
 	// not reloaded on every call.
@@ -86,7 +93,7 @@ func GetOrSet(ctx context.Context, req GetOrSetRequest) (string, error) {
 	}
 	req.Options = withDefaults(req.Options)
 
-	if val, ok := lookup(ctx, ctx, req.Cache, req.Key, req.Options); ok {
+	if val, ok := boundedLookup(ctx, req); ok {
 		return val, nil
 	}
 
@@ -115,10 +122,7 @@ func load(ctx context.Context, req GetOrSetRequest) (string, error) {
 	defer cancel()
 
 	// Another process may have stored the key since our first read.
-	readCtx, cancelRead := context.WithTimeout(ctx, cacheOpTimeout)
-	val, ok := lookup(ctx, readCtx, req.Cache, req.Key, req.Options)
-	cancelRead()
-	if ok {
+	if val, ok := boundedLookup(ctx, req); ok {
 		return val, nil
 	}
 
@@ -138,11 +142,19 @@ func load(ctx context.Context, req GetOrSetRequest) (string, error) {
 	// Set gets its own budget: Load may have used all of ctx.
 	writeCtx, cancelWrite := context.WithTimeout(context.WithoutCancel(ctx), cacheOpTimeout)
 	defer cancelWrite()
-	if err := req.Cache.Set(writeCtx, req.Key, storeVal, jitter(max(req.TTL, 0))); err != nil {
+	if err := req.Cache.Set(writeCtx, req.Key, storeVal, jitter(req.TTL)); err != nil {
 		// The value is still good. The next call will load it again.
 		req.Options.report(err)
 	}
 	return result, nil
+}
+
+// boundedLookup is lookup limited to cacheOpTimeout, so a hung cache costs one
+// short wait instead of the caller's whole deadline.
+func boundedLookup(ctx context.Context, req GetOrSetRequest) (string, bool) {
+	readCtx, cancel := context.WithTimeout(ctx, cacheOpTimeout)
+	defer cancel()
+	return lookup(ctx, readCtx, req.Cache, req.Key, req.Options)
 }
 
 // lookup returns the cached value and whether it was found. A read error other
@@ -167,11 +179,11 @@ func (o GetOrSetOptions) report(err error) {
 	}
 }
 
-// jitter returns ttl changed by up to ±jitterFraction. A non-positive ttl (no
-// expiry) is returned unchanged.
+// jitter returns ttl changed by up to ±jitterFraction. A non-positive ttl means
+// no expiry and returns 0.
 func jitter(ttl time.Duration) time.Duration {
 	if ttl <= 0 {
-		return ttl
+		return 0
 	}
 	spread := float64(ttl) * jitterFraction
 	d := ttl + time.Duration((rand.Float64()*2-1)*spread)

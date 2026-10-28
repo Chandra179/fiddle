@@ -46,6 +46,9 @@ func NewRedisCacheFromConfig(cfg RedisConfig) Cache {
 		ReadTimeout:  cfg.ReadTimeout,
 		WriteTimeout: cfg.WriteTimeout,
 		PoolSize:     cfg.PoolSize,
+		// Without this go-redis ignores ctx deadlines on network I/O, so the
+		// timeouts cacheaside sets would not apply.
+		ContextTimeoutEnabled: true,
 	})
 	return &redisCache{client: rdb}
 }
