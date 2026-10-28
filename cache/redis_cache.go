@@ -46,6 +46,9 @@ func NewRedisCacheFromConfig(cfg RedisConfig) Cache {
 		ReadTimeout:  cfg.ReadTimeout,
 		WriteTimeout: cfg.WriteTimeout,
 		PoolSize:     cfg.PoolSize,
+		// Without this go-redis ignores ctx deadlines on network I/O, so the
+		// timeouts cacheaside sets would not apply.
+		ContextTimeoutEnabled: true,
 	})
 	return &redisCache{client: rdb}
 }
@@ -100,7 +103,11 @@ func (r *redisCache) DelIfValue(ctx context.Context, key, value string) (bool, e
 // SetNX atomically sets key only if it does not exist and reports whether it
 // did. For a lock, store a random token as the value and release it with
 // DelIfValue, not Del. The TTL is not extended and the lock is not reentrant.
+// ttl must be positive, otherwise it returns ErrInvalidTTL.
 func (r *redisCache) SetNX(ctx context.Context, key, value string, ttl time.Duration) (bool, error) {
+	if ttl <= 0 {
+		return false, ErrInvalidTTL
+	}
 	return r.client.SetNX(ctx, key, value, ttl).Result()
 }
 

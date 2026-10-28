@@ -6,6 +6,9 @@ description: "How the cache-aside pattern works and how cacheaside.GetOrSet impl
 seoTitle: "Cache Aside Pattern in Go"
 seoDescription: "Cache-aside pattern in Go: read path, stampede protection, failure handling, and when to use it with Redis."
 answerSummary: "Cache aside is a read pattern: the application checks the cache first, loads from the source on a miss, and stores the result. cacheaside.GetOrSet implements this read path with per-process stampede protection and graceful degradation when Redis fails. Writes and invalidation remain the caller's responsibility."
+links:
+  github: "https://github.com/Chandra179/fiddle/blob/main/cache/cacheaside/cacheaside.go"
+updated: 2026-10-28
 ---
 
 # Cache-aside
@@ -39,7 +42,7 @@ change the source.
    | miss, or Redis read error (counted as a miss)
    v
 +------------------------------+
-| singleflight(key)            |  first caller starts the load;
+| singleflight(cache, key)     |  first caller starts the load;
 |                              |  other callers in this process wait
 +------------------------------+
    |
@@ -47,7 +50,7 @@ change the source.
    v
 +------------------------------+
 | 2. Get(key) again            |---- hit -----------------> return value
-+------------------------------+
++------------------------------+  own 1s limit, apart from LoadTimeout
    |
    | miss
    v
@@ -59,7 +62,7 @@ change the source.
    | ok                    error ---> returned to every waiting caller,
    v                                  nothing cached
 +------------------------------+
-| 4. Set(key, value, TTL)      |  TTL varied by +/- 10%
+| 4. Set(key, value, TTL)      |  TTL varied by +/- 10%, own 1s limit
 +------------------------------+  write error ---> OnError, value still returned
    |
    v
@@ -71,8 +74,10 @@ change the source.
 | Event | Result |
 |---|---|
 | Redis read fails | Treated as a miss. Load runs. `OnError` is called. |
+| Redis hangs | The read inside the load waits at most 1s, then counts as a miss. `Load` keeps its full `LoadTimeout`. |
 | Redis write fails | Value is still returned. `OnError` is called. Next call loads again. |
 | `Load` returns an error | Every waiting caller gets it. Nothing is cached. |
+| `Load` panics | Not recovered: the process ends. `Load` must return errors instead. |
 | `Load` runs past `LoadTimeout` | Its `ctx` is cancelled. If `Load` honors it, every waiting caller gets `DeadlineExceeded`. |
 | A caller's `ctx` ends | That caller returns `ctx.Err()`. The load keeps running for the others. |
 | Two instances miss at once | Each runs `Load` once. Cross-instance dedup is not provided. |
@@ -107,4 +112,4 @@ staleness is acceptable, and the same key is requested in bursts.
 - Loaders under a few milliseconds. The cache round trip costs as much as the load.
 - Reads that must be current after every write (use invalidation or no cache).
 - Large fleets with expensive loaders where cross-instance duplicate loads are
-  measured. That needs a distributed lock, which was removed.
+  measured. That needs a distributed lock, which this package does not provide.
