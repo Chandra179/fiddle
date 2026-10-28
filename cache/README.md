@@ -81,8 +81,7 @@ Caveats:
 ## Testing
 
 ```bash
-make test-unit                             # unit tests, miniredis, no Docker
-make test                                  # all tests, integration needs Docker
+make test    # unit tests on miniredis, no Docker needed
 ```
 
 ## License

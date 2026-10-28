@@ -7,7 +7,7 @@ Multi-module Go monorepo. Each subdirectory is its own Go module.
 | Module | Module path (go.mod) | Has Makefile | Docker needed for tests |
 |--------|---------------------|--------------|------------------------|
 | db/ | `db` | yes | yes (testcontainers) |
-| cache/ | `cache` | yes | no* — unit tests use miniredis |
+| cache/ | `cache` | yes | no — unit tests use miniredis |
 | kafka/ | `kafka` | yes | yes (testcontainers) |
 | rabbitmq/ | `rabbitmq` | yes | yes (testcontainers) |
 | oauth2/ | `oauth2` | yes | no* — mock OIDC server |

@@ -46,7 +46,7 @@ jobs:
       - name: govulncheck
         run: make vuln
 
-  # Integration tests. db, cache, kafka and rabbitmq start their dependencies
+  # Integration tests. db, kafka and rabbitmq start their dependencies
   # with testcontainers (Docker is available on ubuntu-latest); oauth2 and i18n
   # use in-process fakes.
   integration:
@@ -55,7 +55,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        module: [db, cache, kafka, rabbitmq, oauth2, i18n]
+        module: [db, kafka, rabbitmq, oauth2, i18n]
     defaults:
       run:
         working-directory: ${{ matrix.module }}
