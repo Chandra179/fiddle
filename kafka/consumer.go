@@ -16,6 +16,11 @@ const commitTimeout = 10 * time.Second
 
 // ConsumerOptions configures consumer behavior.
 type ConsumerOptions struct {
+	// RetryPolicy is optional. An explicit policy overrides legacy retry fields.
+	RetryPolicy *RetryPolicy
+	DeadLetter  *DeadLetterConfig
+	// Deprecated: configure DeadLetter instead. Setting DLQProducer is rejected
+	// before consumption because its topology and write guarantees are unknown.
 	DLQProducer  Producer
 	OnDLQPublish func(topic string, err error)
 	MaxRetries   int
@@ -23,10 +28,19 @@ type ConsumerOptions struct {
 	Logger       *slog.Logger
 }
 
+// recordIO captures the broker operations that settle one poll.
+type recordIO interface {
+	CommitRecords(context.Context, ...*kgo.Record) error
+	ProduceSync(context.Context, ...*kgo.Record) kgo.ProduceResults
+}
+
 // consumer implements the Consumer interface.
 type consumer struct {
 	client  *kgo.Client
+	records recordIO
 	options ConsumerOptions
+	policy  RetryPolicy
+	initErr error
 }
 
 // NewConsumer creates a new Consumer with the given client and options.
@@ -46,10 +60,31 @@ func NewConsumer(client *kgo.Client, opts ...ConsumerOptions) Consumer {
 		if o.Logger != nil {
 			options.Logger = o.Logger
 		}
+		if o.RetryPolicy != nil {
+			options.RetryPolicy = o.RetryPolicy
+		}
+		if o.DeadLetter != nil {
+			options.DeadLetter = o.DeadLetter
+		}
 		options.DLQProducer = o.DLQProducer
 		options.OnDLQPublish = o.OnDLQPublish
 	}
-	return &consumer{client: client, options: options}
+	var topics []string
+	if client != nil {
+		topics, _ = client.OptValue(kgo.ConsumeTopics).([]string)
+	}
+	options.DeadLetter = options.DeadLetter.normalized(topics)
+	policy := options.RetryPolicy.normalized()
+	if options.RetryPolicy == nil {
+		policy.MaxRetries = options.MaxRetries
+		policy.InitialBackoff = options.RetryBackoff
+		policy.MaxBackoff = max(policy.MaxBackoff, policy.InitialBackoff)
+	}
+	initErr := errors.Join(policy.validate(options.DeadLetter != nil), options.DeadLetter.validate(topics))
+	if options.DLQProducer != nil {
+		initErr = errors.Join(initErr, errors.New("DLQProducer is deprecated; configure DeadLetter instead"))
+	}
+	return &consumer{client: client, records: client, options: options, policy: policy, initErr: initErr}
 }
 
 // Start begins consuming messages and processing them with the handler.
@@ -58,11 +93,30 @@ func NewConsumer(client *kgo.Client, opts ...ConsumerOptions) Consumer {
 // Offsets of processed records are committed once per poll, so records still in
 // flight at shutdown are redelivered on restart (at-least-once).
 //
-// If publishing a failed record to the DLQ fails, Start returns an error
-// wrapping ErrDLQPublish without committing that record or any later one. The
+// If processing stops or publishing to the DLQ fails, Start returns an error
+// without committing that record or any later one. DLQ failures wrap ErrDLQPublish. The
 // client has already fetched past them, so close it and create a new one to have
 // them redelivered.
 func (c *consumer) Start(ctx context.Context, handler Handler) error {
+	if c.initErr != nil {
+		return c.initErr
+	}
+	if c.client == nil || handler == nil {
+		return errors.New("consumer requires a client and handler")
+	}
+	if group, _ := c.client.OptValue(kgo.ConsumerGroup).(string); group == "" {
+		return errors.New("reliable consumption requires a consumer group")
+	} else {
+		if disabled, _ := c.client.OptValue(kgo.DisableAutoCommit).(bool); !disabled {
+			return errors.New("consumer requires DisableAutoCommit")
+		}
+		if blocked, _ := c.client.OptValue(kgo.BlockRebalanceOnPoll).(bool); !blocked {
+			return errors.New("consumer requires BlockRebalanceOnPoll")
+		}
+	}
+	if err := prepareDeadLetter(ctx, c.client, c.options.DeadLetter); err != nil {
+		return fmt.Errorf("prepare dead-letter topic: %w", err)
+	}
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -88,11 +142,14 @@ func (c *consumer) Start(ctx context.Context, handler Handler) error {
 func (c *consumer) processFetches(ctx context.Context, fetches kgo.Fetches, handler Handler) error {
 	logger := c.options.Logger
 
-	// A fetch error on one partition must not drop records fetched from healthy ones.
+	// Process healthy partitions before returning fetch errors; never busy-loop
+	// on a persistent broker/authorization failure.
+	var fetchErr error
 	fetches.EachError(func(topic string, partition int32, err error) {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return
 		}
+		fetchErr = errors.Join(fetchErr, fmt.Errorf("fetch topic %s partition %d: %w", topic, partition, err))
 		logger.Error("fetch error", "topic", topic, "partition", partition, "error", err)
 	})
 
@@ -114,87 +171,34 @@ func (c *consumer) processFetches(ctx context.Context, fetches kgo.Fetches, hand
 		// redeliver records that were already handled.
 		commitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), commitTimeout)
 		defer cancel()
-		if err := c.client.CommitRecords(commitCtx, processed...); err != nil {
-			logger.Error("commit error", "error", err)
+		if err := c.records.CommitRecords(commitCtx, processed...); err != nil {
+			return errors.Join(procErr, fetchErr, fmt.Errorf("commit processed offsets: %w", err))
 		}
 	}
 
-	return procErr
+	return errors.Join(procErr, fetchErr)
 }
 
-// handleRecord runs handler with retries and routes a final failure to the DLQ.
-// A non-nil error means the record must not be committed.
+// handleRecord leaves all settlement to processFetches. A non-nil error
+// stops the poll at this record; neither it nor later records are committed.
 func (c *consumer) handleRecord(ctx context.Context, r *kgo.Record, handler Handler) error {
-	logger := c.options.Logger
-
-	var lastErr error
-	for attempt := 0; attempt <= c.options.MaxRetries; attempt++ {
-		if attempt > 0 {
-			backoff := time.Duration(attempt) * c.options.RetryBackoff
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(backoff):
-			}
-		}
-
-		if lastErr = handler(recordContext(ctx, r), r); lastErr == nil {
-			return nil
-		}
-		// A handler that failed because Start's ctx was cancelled did not fail
-		// on its merits: neither retry it nor dead-letter the record. It stays
-		// uncommitted and is redelivered after restart.
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		logger.Warn("handler error, retrying",
-			"topic", r.Topic,
-			"partition", r.Partition,
-			"offset", r.Offset,
-			"attempt", attempt+1,
-			"max_retries", c.options.MaxRetries,
-			"error", lastErr,
-		)
+	failure := c.policy.process(ctx, func(attemptCtx context.Context) error { return handler(recordContext(attemptCtx, r), r) })
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-
-	return c.deadLetter(ctx, r, lastErr)
-}
-
-// deadLetter publishes a record whose handler kept failing to the DLQ. A
-// non-nil error means the record must not be committed.
-func (c *consumer) deadLetter(ctx context.Context, r *kgo.Record, handlerErr error) error {
-	logger := c.options.Logger
-
-	if c.options.DLQProducer == nil {
-		logger.Error("handler failed, no DLQ configured",
-			"topic", r.Topic,
-			"partition", r.Partition,
-			"offset", r.Offset,
-			"error", handlerErr,
-		)
+	if failure.err == nil {
 		return nil
 	}
-
-	if err := c.options.DLQProducer.SendToDLQ(ctx, r.Topic, r.Value, r.Key, handlerErr); err != nil {
-		logger.Error("failed to send message to DLQ",
-			"error", err,
-			"topic", r.Topic,
-			"partition", r.Partition,
-			"offset", r.Offset,
-			"dlq_error", handlerErr,
-		)
-		return fmt.Errorf("%w: topic %s partition %d offset %d: %w", ErrDLQPublish, r.Topic, r.Partition, r.Offset, err)
+	if !failure.park || c.options.DeadLetter == nil || c.options.DeadLetter.Topic == r.Topic {
+		return fmt.Errorf("topic %s partition %d offset %d: %w", r.Topic, r.Partition, r.Offset, failure.paused())
 	}
-
-	logger.Error("message sent to DLQ",
-		"topic", r.Topic,
-		"partition", r.Partition,
-		"offset", r.Offset,
-		"dlq_topic", dlqTopic(r.Topic),
-		"error", handlerErr,
-	)
+	publishCtx, cancel := context.WithTimeout(ctx, c.options.DeadLetter.Timeout)
+	defer cancel()
+	if err := c.records.ProduceSync(publishCtx, deadLetterRecord(c.options.DeadLetter, r, failure)).FirstErr(); err != nil {
+		return fmt.Errorf("%w: topic %s partition %d offset %d: %w", ErrDLQPublish, r.Topic, r.Partition, r.Offset, errors.Join(failure.paused(), err))
+	}
 	if c.options.OnDLQPublish != nil {
-		c.options.OnDLQPublish(r.Topic, handlerErr)
+		c.options.OnDLQPublish(r.Topic, failure.err)
 	}
 	return nil
 }

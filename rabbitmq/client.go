@@ -63,6 +63,7 @@ type Client struct {
 	consumerConn  *amqp.Connection
 
 	publisherPool *channelPool
+	transferSlots chan struct{}
 
 	state     atomic.Int32
 	closeChan chan struct{}
@@ -113,6 +114,7 @@ func NewClient(config *Config, logger *slog.Logger) (*Client, error) {
 			bindings:  make([]BindingConfig, 0),
 		},
 	}
+	client.transferSlots = make(chan struct{}, config.ChannelPoolSize)
 	client.publisherPool = newChannelPool(config.ChannelPoolSize, client.newPublisherChannel)
 
 	client.state.Store(int32(StateConnecting))

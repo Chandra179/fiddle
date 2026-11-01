@@ -45,6 +45,8 @@ type Config struct {
 	TLSConfig *tls.Config
 
 	// Producer settings
+	// TransferTimeout bounds internal transfer connections and all their socket I/O.
+	TransferTimeout    time.Duration
 	PublisherConfirms  bool
 	ChannelPoolSize    int
 	Mandatory          bool
@@ -61,26 +63,12 @@ type Config struct {
 	// auto-delete, ...) are set per queue in QueueConfig.
 	QueueType QueueType
 
-	// Retry/DLX settings.
-	//
-	// RetryEnabled: reject a failed delivery without requeue, so the queue's
-	// dead-letter exchange routes it to the TTL retry queue (see
-	// TopologyManager.SetupDeadLetterExchange). Without a DLX it is dropped.
-	//
-	// Without RetryEnabled, the client waits RetryBackoff (doubling per retry),
-	// then republishes the message with an incremented "x-retry-count" header
-	// and acks the original. This bounds retries on any queue type. The wait
-	// blocks the consume loop, which slows the consumer while a dependency
-	// keeps failing. If the ack is lost the message is delivered twice.
-	//
-	// RetryBackoff: zero uses DefaultRetryBackoff, negative retries at once.
-	// Ignored when RetryEnabled is true.
-	//
-	// MaxRetries: retries after the first failure. Zero uses DefaultMaxRetries,
-	// negative means no retries.
-	//
-	// DeadLetterEnabled: after MaxRetries, publish the message to
-	// "<queue>.parking-lot" and ack it; otherwise reject it.
+	// Legacy retry settings. MaxRetries/RetryBackoff supply defaults when a
+	// subscription does not set ConsumeOptions.RetryPolicy. Zero uses defaults;
+	// a negative MaxRetries disables retries. RetryEnabled is no longer accepted:
+	// processing retries are in place rather than broker-side republish loops.
+	// DeadLetterEnabled enables the conventional existing <queue>.parking-lot
+	// destination; prefer per-subscription DeadLetterConfig for explicit topology.
 	RetryEnabled      bool
 	RetryBackoff      time.Duration
 	MaxRetries        int
@@ -104,6 +92,7 @@ type Config struct {
 func NewDefaultConfig() *Config {
 	return &Config{
 		ConnectionName:           "go-service",
+		TransferTimeout:          10 * time.Second,
 		PublisherConfirms:        false,
 		ChannelPoolSize:          DefaultChannelPoolSize,
 		Mandatory:                false,
@@ -124,11 +113,15 @@ func NewDefaultConfig() *Config {
 // ConnectionName, ChannelPoolSize, PrefetchCount, QueueType, RetryBackoff,
 // MaxRetries, ReconnectInitialInterval and ReconnectMaxInterval. Zero means
 // "unset", so MaxRetries: 0 becomes DefaultMaxRetries; a negative RetryBackoff
-// or MaxRetries is kept and means "none". Other negative values are left for
+// MaxRetries is kept and disables retries; non-positive RetryBackoff now uses
+// the policy default. Other negative values are left for
 // Validate to reject. Booleans and URL are never touched.
 func (c *Config) ApplyDefaults() {
 	def := NewDefaultConfig()
 
+	if c.TransferTimeout == 0 {
+		c.TransferTimeout = 10 * time.Second
+	}
 	c.ConnectionName = cmp.Or(c.ConnectionName, def.ConnectionName)
 	c.ChannelPoolSize = cmp.Or(c.ChannelPoolSize, def.ChannelPoolSize)
 	c.PrefetchCount = cmp.Or(c.PrefetchCount, def.PrefetchCount)
@@ -142,6 +135,12 @@ func (c *Config) ApplyDefaults() {
 // Validate reports the first invalid field. It does not modify the config; call
 // ApplyDefaults first to fill unset fields (NewClient does both).
 func (c *Config) Validate() error {
+	if c.RetryEnabled {
+		return errors.New("RetryEnabled broker retry loops are unsupported; configure ConsumeOptions.RetryPolicy")
+	}
+	if c.TransferTimeout < 0 {
+		return errors.New("negative TransferTimeout")
+	}
 	if c.URL == "" {
 		return ErrURLRequired
 	}
