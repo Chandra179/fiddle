@@ -6,7 +6,6 @@ import (
 	"io"
 	"log/slog"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -14,25 +13,30 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-// recordingDLQ is a Producer that only records SendToDLQ calls.
-type recordingDLQ struct {
-	calls []error
+type recordingIO struct {
+	committed  []*kgo.Record
+	published  []*kgo.Record
+	publishErr error
+	commitErr  error
 }
 
-func (*recordingDLQ) Produce(context.Context, *Message) error        { return nil }
-func (*recordingDLQ) SendMessage(context.Context, string, any) error { return nil }
-func (d *recordingDLQ) SendToDLQ(_ context.Context, _ string, _, _ []byte, err error) error {
-	d.calls = append(d.calls, err)
-	return nil
+func (r *recordingIO) CommitRecords(_ context.Context, records ...*kgo.Record) error {
+	r.committed = append(r.committed, records...)
+	return r.commitErr
 }
-
-func newTestConsumer(dlq Producer) *consumer {
-	return &consumer{options: ConsumerOptions{
-		DLQProducer:  dlq,
-		MaxRetries:   2,
-		RetryBackoff: time.Millisecond,
-		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
-	}}
+func (r *recordingIO) ProduceSync(_ context.Context, records ...*kgo.Record) kgo.ProduceResults {
+	var results kgo.ProduceResults
+	for _, record := range records {
+		r.published = append(r.published, record)
+		results = append(results, kgo.ProduceResult{Record: record, Err: r.publishErr})
+	}
+	return results
+}
+func newTestConsumer(records *recordingIO) *consumer {
+	if records == nil {
+		records = &recordingIO{}
+	}
+	return &consumer{records: records, policy: quickPolicy(UnknownFailure), options: ConsumerOptions{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}}
 }
 
 func TestHandleRecord_PassesContextToHandler(t *testing.T) {
@@ -50,7 +54,7 @@ func TestHandleRecord_PassesContextToHandler(t *testing.T) {
 
 func TestHandleRecord_HandlerSeesShutdown(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	dlq := &recordingDLQ{}
+	dlq := &recordingIO{}
 
 	err := newTestConsumer(dlq).handleRecord(ctx, &kgo.Record{Topic: "t"}, func(ctx context.Context, _ *kgo.Record) error {
 		cancel() // shutdown arrives while the handler runs
@@ -59,22 +63,21 @@ func TestHandleRecord_HandlerSeesShutdown(t *testing.T) {
 	})
 
 	assert.ErrorIs(t, err, context.Canceled)
-	assert.Empty(t, dlq.calls, "a record interrupted by shutdown must not be dead-lettered")
+	assert.Empty(t, dlq.published, "a record interrupted by shutdown must not be dead-lettered")
 }
 
-func TestHandleRecord_DeadLettersAfterRetries(t *testing.T) {
-	dlq := &recordingDLQ{}
-	boom := errors.New("boom")
-	attempts := 0
-
-	err := newTestConsumer(dlq).handleRecord(context.Background(), &kgo.Record{Topic: "t"}, func(context.Context, *kgo.Record) error {
-		attempts++
-		return boom
-	})
-
-	require.NoError(t, err)
-	assert.Equal(t, 3, attempts, "1 attempt + MaxRetries retries")
-	assert.Equal(t, []error{boom}, dlq.calls)
+func TestHandleRecord_UnknownFailureDoesNotPublishOrCommit(t *testing.T) {
+	records := &recordingIO{}
+	c := newTestConsumer(records)
+	c.options.DeadLetter = (&DeadLetterConfig{Topic: "failed"}).normalized(nil)
+	boom := errors.New("service failure")
+	calls := 0
+	err := c.handleRecord(context.Background(), &kgo.Record{Topic: "orders"}, func(context.Context, *kgo.Record) error { calls++; return boom })
+	require.ErrorIs(t, err, ErrConsumerPaused)
+	require.ErrorIs(t, err, boom)
+	assert.Equal(t, 3, calls)
+	assert.Empty(t, records.published)
+	assert.Empty(t, records.committed)
 }
 
 func TestRecordContext_CarriesRecordSpan(t *testing.T) {

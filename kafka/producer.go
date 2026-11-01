@@ -176,6 +176,9 @@ func (p *producer) SendMessage(ctx context.Context, topic string, payload any) e
 // SendToDLQ publishes a record to originalTopic+".dlq" and waits for the broker
 // to acknowledge it.
 func (p *producer) SendToDLQ(ctx context.Context, originalTopic string, value []byte, key []byte, dlqErr error) error {
+	if p.client == nil || p.client.OptValue(kgo.RequiredAcks) != kgo.AllISRAcks() {
+		return errors.New("dead-letter publishing requires a client with AllISRAcks")
+	}
 
 	errMsg := "unknown error"
 	if dlqErr != nil {

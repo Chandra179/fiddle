@@ -33,9 +33,10 @@ type Producer interface {
 // handler can stop on shutdown. With Config.EnableOTel it also carries the
 // record's receive span, so spans started from it join the producer's trace.
 //
-// A non-nil error is retried (ConsumerOptions.MaxRetries) and then sent to the
-// DLQ. The record's dlq_error header holds the error's class or type, not its
-// message (see WithDLQClass and WithDLQErrorFormatter).
+// RetryPolicy classifies a non-nil error. Unknown errors have a bounded retry
+// budget and then stop consumption without advancing offsets. Permanent errors
+// can be parked through DeadLetterConfig; dependency outages stop immediately.
+// DLQ error text is opt-in through DeadLetterConfig.ErrorFormatter.
 type Handler func(ctx context.Context, record *kgo.Record) error
 
 // Consumer consumes messages from Kafka topics.
